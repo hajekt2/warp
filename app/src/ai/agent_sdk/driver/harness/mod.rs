@@ -25,7 +25,7 @@ use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
     SESSION_SHARING_SERVER_URL_OVERRIDE_ENV, WS_SERVER_URL_OVERRIDE_ENV,
 };
-use warp_core::channel::ChannelState;
+use warp_core::{channel::ChannelState, features::FeatureFlag};
 
 use super::terminal::{CommandHandle, TerminalDriver};
 use super::{
@@ -34,6 +34,7 @@ use super::{
     OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
 
+mod acp;
 mod claude_code;
 pub(crate) mod claude_transcript;
 mod gemini;
@@ -41,6 +42,7 @@ mod json_utils;
 
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
+use acp::AcpHarness;
 use gemini::GeminiHarness;
 
 /// Harness-agnostic payload describing how to resume an existing conversation.
@@ -132,6 +134,8 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
 /// Harness type for driver dispatch.
 pub(crate) enum HarnessKind {
     Oz,
+    /// ACP protocol-backed harness. This is not terminal/TUI based.
+    Acp(AcpHarness),
     /// Third-party CLI-backed harness (e.g. Claude, Gemini).
     ThirdParty(Box<dyn ThirdPartyHarness>),
     /// Harnesses that exist in the shared CLI enum but are not supported by the
@@ -144,6 +148,7 @@ impl HarnessKind {
     pub(crate) fn harness(&self) -> Harness {
         match self {
             HarnessKind::Oz => Harness::Oz,
+            HarnessKind::Acp(_) => Harness::Acp,
             HarnessKind::ThirdParty(h) => h.harness(),
             HarnessKind::Unsupported(harness) => *harness,
         }
@@ -167,6 +172,8 @@ pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverE
         Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
         Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
         Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
+        Harness::Acp if FeatureFlag::AcpClient.is_enabled() => Ok(HarnessKind::Acp(AcpHarness::new())),
+        Harness::Acp => Ok(HarnessKind::Unsupported(Harness::Acp)),
         Harness::Unknown => Err(AgentDriverError::InvalidRuntimeState),
     }
 }
