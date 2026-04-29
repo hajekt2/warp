@@ -723,7 +723,6 @@ impl settings_value::SettingsValue for ToolbarCommandMap {
     settings_value::SettingsValue,
 )]
 #[serde(transparent)]
-#[schemars(transparent)]
 pub struct AcpAgentId(String);
 
 impl AcpAgentId {
