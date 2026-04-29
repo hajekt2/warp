@@ -14465,6 +14465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp_acp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "warp_cli"
 version = "0.0.0"
 dependencies = [
