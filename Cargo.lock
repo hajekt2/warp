@@ -14379,6 +14379,7 @@ dependencies = [
  "walkdir",
  "warp-command-signatures",
  "warp-workflows",
+ "warp_acp",
  "warp_cli",
  "warp_completer",
  "warp_core",

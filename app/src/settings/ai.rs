@@ -848,6 +848,31 @@ pub struct AcpAgentConfig {
 }
 
 impl AcpAgentConfig {
+    pub fn to_launch_command(&self) -> anyhow::Result<warp_acp::AcpAgentCommand> {
+        let mut command =
+            warp_acp::AcpAgentCommand::new(self.command.clone()).args(self.args.clone());
+        let mut env = Vec::with_capacity(self.env.len());
+        for env_var in &self.env {
+            let value = match &env_var.value {
+                AcpAgentEnvValue::Literal { value } => value.clone(),
+                AcpAgentEnvValue::SecretRef { key } => {
+                    anyhow::bail!(
+                        "ACP agent '{}' references secret env var '{}', but ACP secret materialization is not wired yet",
+                        self.name,
+                        key
+                    );
+                }
+            };
+            env.push(warp_acp::AcpEnvironmentVariable::new(
+                env_var.name.clone(),
+                value,
+            ));
+        }
+        command = command.env(env);
+        command.validate_argv_only()?;
+        Ok(command)
+    }
+
     pub fn from_registry_entry(entry: &AcpAgentRegistryEntry) -> Self {
         Self {
             id: AcpAgentId::new(entry.registry_key),

@@ -424,7 +424,10 @@ fn test_configured_acp_agents_are_feature_gated() {
 
         let _enabled = FeatureFlag::AcpClient.override_enabled(true);
         AISettings::handle(&app).read(&app, |settings, _ctx| {
-            assert_eq!(settings.configured_acp_agents(), std::slice::from_ref(&config));
+            assert_eq!(
+                settings.configured_acp_agents(),
+                std::slice::from_ref(&config)
+            );
             assert_eq!(
                 settings.acp_agent_config(&AcpAgentId::new("opencode")),
                 Some(&config)

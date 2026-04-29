@@ -22,7 +22,8 @@ use crate::ai::skills::{SkillManager, SkillWatcher};
 use crate::ai::{
     agent::conversation::AIConversationId,
     agent_sdk::driver::harness::{
-        task_env_vars, HarnessKind, HarnessRunner, ResumePayload, SavePoint, ThirdPartyHarness,
+        task_env_vars, AcpHarness, HarnessKind, HarnessRunner, ResumePayload, SavePoint,
+        ThirdPartyHarness,
     },
 };
 use crate::terminal::cli_agent_sessions::plugin_manager::{
@@ -65,6 +66,7 @@ use crate::{
             ServerApiProvider,
         },
     },
+    settings::AISettings,
     terminal::view::ConversationRestorationInNewPaneType,
 };
 use ai::skills::ParsedSkill;
@@ -76,6 +78,7 @@ use futures::{
 };
 use oneshot::{Canceled, Receiver, Sender};
 use uuid::Uuid;
+use warp_acp::{AcpClient, ContentBlock, NewSessionRequest};
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
 use warp_cli::share::ShareRequest;
@@ -1414,7 +1417,9 @@ impl AgentDriver {
                     Self::prepare_harness(&task.prompt, harness.as_ref(), &foreground).await?;
                 Self::run_harness(runner, &foreground, harness_exit_rx).await
             }
-            HarnessKind::Acp(harness) => Err(harness.setup_error()),
+            HarnessKind::Acp(harness) => {
+                Self::run_acp_harness(harness, task.prompt, &foreground).await
+            }
             HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
                 harness: harness.to_string(),
                 reason: format!(
@@ -1422,6 +1427,75 @@ impl AgentDriver {
                 ),
             }),
         }
+    }
+
+    /// Execute a configured ACP agent through JSON-RPC stdio.
+    ///
+    /// This is intentionally separate from the terminal-backed `HarnessRunner` path:
+    /// ACP agents are subprocess protocols, not TUIs whose scrollback should be scraped.
+    async fn run_acp_harness(
+        _harness: AcpHarness,
+        prompt: AgentRunPrompt,
+        foreground: &ModelSpawner<Self>,
+    ) -> Result<(), AgentDriverError> {
+        let (working_dir, config, server_api) = foreground
+            .spawn(|me, ctx| {
+                let config = AISettings::as_ref(ctx)
+                    .configured_acp_agents()
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| AgentDriverError::HarnessSetupFailed {
+                        harness: Harness::Acp.to_string(),
+                        reason: "No ACP agents are configured in AI settings.".to_string(),
+                    })?;
+                Ok::<_, AgentDriverError>((
+                    me.working_dir.clone(),
+                    config,
+                    ServerApiProvider::as_ref(ctx).get_harness_support_client(),
+                ))
+            })
+            .await??;
+
+        let prompt_text: Cow<'_, str> = match prompt {
+            AgentRunPrompt::Local(text) => Cow::Owned(text),
+            AgentRunPrompt::ServerSide {
+                skill,
+                attachments_dir,
+            } => {
+                let skill = skill.map(|parsed_skill| ResolvePromptAttachedSkill {
+                    name: parsed_skill.name,
+                    content: parsed_skill.content,
+                    path: Some(parsed_skill.path.to_string_lossy().to_string()),
+                });
+                let resolved = server_api
+                    .resolve_prompt(ResolvePromptRequest {
+                        skill,
+                        attachments_dir,
+                    })
+                    .await
+                    .map_err(AgentDriverError::PromptResolutionFailed)?;
+                Cow::Owned(resolved.prompt)
+            }
+        };
+
+        let command = config
+            .to_launch_command()
+            .map_err(AgentDriverError::ConfigBuildFailed)?;
+        let prompt = prompt_text.into_owned();
+        tokio::task::spawn_blocking(move || {
+            let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
+            client.initialize("Warp").map_err(anyhow::Error::from)?;
+            let session = client
+                .new_session(NewSessionRequest::new(working_dir))
+                .map_err(anyhow::Error::from)?;
+            client
+                .prompt(session.session_id, vec![ContentBlock::text(prompt)])
+                .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?
+        .map_err(AgentDriverError::ConfigBuildFailed)
     }
 
     /// Sets up the third-party harness by subscribing to CLI session events and

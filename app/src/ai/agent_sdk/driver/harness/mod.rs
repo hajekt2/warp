@@ -40,7 +40,7 @@ pub(crate) mod claude_transcript;
 mod gemini;
 mod json_utils;
 
-use acp::AcpHarness;
+pub(crate) use acp::AcpHarness;
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
 use gemini::GeminiHarness;

@@ -531,10 +531,8 @@ impl AmbientAgentViewModel {
             .filter(|s| !s.is_empty());
 
         let harness_override = match self.harness_selection.builtin_harness() {
-            Some(harness) if harness != Harness::Oz => {
-                Some(HarnessConfig::from_harness_type(harness))
-            }
             Some(Harness::Oz) | None => None,
+            Some(harness) => Some(HarnessConfig::from_harness_type(harness)),
         };
 
         let config = Some(AgentConfigSnapshot {
