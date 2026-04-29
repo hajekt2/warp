@@ -350,6 +350,88 @@ fn test_toolbar_command_map_roundtrip() {
 }
 
 #[test]
+fn test_acp_agent_registry_contains_seed_agents() {
+    let opencode = KNOWN_ACP_AGENTS
+        .iter()
+        .find(|entry| entry.registry_key == "opencode")
+        .expect("opencode ACP registry entry exists");
+    assert_eq!(opencode.command.command, "opencode");
+    assert_eq!(opencode.command.args, &["acp"]);
+
+    let codex = KNOWN_ACP_AGENTS
+        .iter()
+        .find(|entry| entry.registry_key == "codex-acp")
+        .expect("codex ACP registry entry exists");
+    assert_eq!(codex.command.command, "codex-acp");
+    assert_eq!(codex.command.args, &[] as &[&str]);
+    assert_eq!(
+        codex.fallback_command,
+        Some(AcpAgentCommandTemplate {
+            command: "npx",
+            args: &["-y", "@zed-industries/codex-acp"],
+        })
+    );
+}
+
+#[test]
+fn test_acp_agent_config_roundtrip() {
+    use settings_value::SettingsValue;
+
+    let original = AcpAgentConfig {
+        id: AcpAgentId::new("opencode-local"),
+        name: "OpenCode".to_string(),
+        command: "opencode".to_string(),
+        args: vec!["acp".to_string()],
+        env: vec![AcpAgentEnvVar {
+            name: "OPENCODE_CONFIG".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "opencode-config".to_string(),
+            },
+        }],
+        mcp_allowlist: vec!["mcp-server-1".to_string()],
+        install_url: Some("https://opencode.ai".to_string()),
+        registry_key: Some("opencode".to_string()),
+        local_confirmation: AcpAgentLocalConfirmation {
+            confirmed_on_this_device: true,
+            confirmed_at: Some("2026-04-29T21:00:00Z".to_string()),
+        },
+    };
+
+    let file_value = original.to_file_value();
+    let restored = AcpAgentConfig::from_file_value(&file_value).unwrap();
+    assert_eq!(original, restored);
+}
+
+#[test]
+fn test_configured_acp_agents_are_feature_gated() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let config = AcpAgentConfig::from_registry_entry(&KNOWN_ACP_AGENTS[0]);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .acp_agent_configs
+                .set_value(vec![config.clone()], ctx)
+                .unwrap();
+        });
+
+        let _disabled = FeatureFlag::AcpClient.override_enabled(false);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.configured_acp_agents().is_empty());
+            assert!(AISettings::known_acp_agent_registry().is_empty());
+        });
+        drop(_disabled);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(settings.configured_acp_agents(), &[config]);
+            assert_eq!(settings.acp_agent_config(&AcpAgentId::new("opencode")), Some(&config));
+            assert!(!AISettings::known_acp_agent_registry().is_empty());
+        });
+    });
+}
+
+#[test]
 fn test_toolbar_command_map_matched_agent() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);

@@ -29,6 +29,7 @@ use crate::server::server_api::ai::{
     AgentConfigSnapshot, AmbientAgentTaskState, AttachmentInput, SpawnAgentRequest,
 };
 use crate::server::server_api::{AIApiError, CloudAgentCapacityError, ServerApiProvider};
+use crate::settings::ai::AcpAgentId;
 use crate::terminal::view::ambient_agent::SetupCommandState;
 
 use super::AmbientAgentProgressUIState;
@@ -72,6 +73,38 @@ pub enum Status {
     Cancelled { progress: AgentProgress },
 }
 
+/// Local UI/runtime identity for the selected agent backend.
+///
+/// Built-in harnesses remain represented by [`Harness`]. Dynamic ACP agents carry a stable
+/// settings ID instead of being encoded into a field-bearing harness enum variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHarnessSelection {
+    Builtin(Harness),
+    Acp(AcpAgentId),
+}
+
+impl Default for AgentHarnessSelection {
+    fn default() -> Self {
+        Self::Builtin(Harness::default())
+    }
+}
+
+impl AgentHarnessSelection {
+    pub fn builtin_harness(&self) -> Option<Harness> {
+        match self {
+            Self::Builtin(harness) => Some(*harness),
+            Self::Acp(_) => None,
+        }
+    }
+
+    pub fn acp_agent_id(&self) -> Option<&AcpAgentId> {
+        match self {
+            Self::Builtin(_) => None,
+            Self::Acp(id) => Some(id),
+        }
+    }
+}
+
 /// Model to track the state of an ambient agent run.
 pub struct AmbientAgentViewModel {
     status: Status,
@@ -101,9 +134,11 @@ pub struct AmbientAgentViewModel {
     /// from the server response can be wired back to the conversation.
     conversation_id: Option<AIConversationId>,
 
-    /// Selected execution harness for the cloud agent run.
-    /// Defaults to `Harness::Oz`. Used to populate `AgentConfigSnapshot.harness` on spawn.
-    harness: Harness,
+    /// Selected execution backend for the cloud agent run.
+    /// Defaults to built-in `Harness::Oz`. Built-in selections populate
+    /// `AgentConfigSnapshot.harness` on spawn; ACP selections are kept local until the ACP runner
+    /// path is implemented.
+    harness_selection: AgentHarnessSelection,
     /// Whether the optimistic InitialUserQuery block has been inserted for the current run.
     has_inserted_cloud_mode_user_query_block: bool,
     /// Whether the harness CLI (e.g. `claude`, `gemini`) has started running for a non-oz run.
@@ -138,7 +173,7 @@ impl AmbientAgentViewModel {
             setup_commands_state: Default::default(),
             task_id: None,
             conversation_id: None,
-            harness: Harness::default(),
+            harness_selection: AgentHarnessSelection::default(),
             has_inserted_cloud_mode_user_query_block: false,
             harness_command_started: false,
         }
@@ -230,21 +265,39 @@ impl AmbientAgentViewModel {
     }
 
     pub fn selected_harness(&self) -> Harness {
-        self.harness
+        self.harness_selection
+            .builtin_harness()
+            .unwrap_or(Harness::Oz)
+    }
+
+    pub fn selected_harness_selection(&self) -> &AgentHarnessSelection {
+        &self.harness_selection
     }
 
     pub fn set_harness(&mut self, harness: Harness, ctx: &mut ModelContext<Self>) {
-        if self.harness == harness {
+        self.set_harness_selection(AgentHarnessSelection::Builtin(harness), ctx);
+    }
+
+    pub fn set_harness_selection(
+        &mut self,
+        selection: AgentHarnessSelection,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.harness_selection == selection {
             return;
         }
-        self.harness = harness;
+        self.harness_selection = selection;
         ctx.emit(AmbientAgentViewModelEvent::HarnessSelected);
     }
 
     /// True when the run is configured to use a non-Oz execution harness and the
     /// required feature flags are enabled.
     pub(super) fn is_third_party_harness(&self) -> bool {
-        FeatureFlag::AgentHarness.is_enabled() && self.harness != Harness::Oz
+        FeatureFlag::AgentHarness.is_enabled()
+            && matches!(
+                self.harness_selection,
+                AgentHarnessSelection::Builtin(harness) if harness != Harness::Oz
+            )
     }
 
     /// Whether the harness CLI has started running. Only meaningful for non-oz runs.
@@ -256,7 +309,7 @@ impl AmbientAgentViewModel {
     /// Idempotent: subsequent calls after the first are no-ops and do not re-emit.
     pub(super) fn mark_harness_command_started(&mut self, ctx: &mut ModelContext<Self>) {
         debug_assert!(
-            self.harness != Harness::Oz,
+            self.selected_harness() != Harness::Oz,
             "harness_command_started is only meaningful for non-oz runs"
         );
         if self.harness_command_started {
@@ -477,8 +530,12 @@ impl AmbientAgentViewModel {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let harness_override =
-            (self.harness != Harness::Oz).then(|| HarnessConfig::from_harness_type(self.harness));
+        let harness_override = match self.harness_selection.builtin_harness() {
+            Some(harness) if harness != Harness::Oz => {
+                Some(HarnessConfig::from_harness_type(harness))
+            }
+            Some(Harness::Oz) | None => None,
+        };
 
         let config = Some(AgentConfigSnapshot {
             environment_id: self.environment_id.as_ref().map(|id| id.to_string()),
@@ -950,4 +1007,26 @@ pub enum AmbientAgentViewModelEvent {
 
 impl Entity for AmbientAgentViewModel {
     type Event = AmbientAgentViewModelEvent;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_harness_selection_preserves_static_harness_identity() {
+        let selection = AgentHarnessSelection::Builtin(Harness::Claude);
+
+        assert_eq!(selection.builtin_harness(), Some(Harness::Claude));
+        assert_eq!(selection.acp_agent_id(), None);
+    }
+
+    #[test]
+    fn acp_harness_selection_uses_dynamic_settings_identity() {
+        let id = AcpAgentId::new("opencode");
+        let selection = AgentHarnessSelection::Acp(id.clone());
+
+        assert_eq!(selection.builtin_harness(), None);
+        assert_eq!(selection.acp_agent_id(), Some(&id));
+    }
 }

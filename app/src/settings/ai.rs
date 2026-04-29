@@ -707,6 +707,212 @@ impl settings_value::SettingsValue for ToolbarCommandMap {
     }
 }
 
+/// Stable identifier for a configured ACP agent.
+///
+/// Dynamic ACP agent identity intentionally lives outside `Harness`/`CLIAgent`, which are
+/// fieldless enums used for built-in agents and static command-prefix detection.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct AcpAgentId(String);
+
+impl AcpAgentId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for AcpAgentId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for AcpAgentId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for AcpAgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Environment values for a configured ACP agent.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[schemars(rename_all = "snake_case")]
+pub enum AcpAgentEnvValue {
+    /// A literal value. Avoid using this for secrets; prefer `SecretRef`.
+    Literal { value: String },
+    /// Reference to a secret managed outside synced settings.
+    SecretRef { key: String },
+}
+
+/// One environment variable requested by a configured ACP agent.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Environment variable configuration for an ACP agent.")]
+pub struct AcpAgentEnvVar {
+    pub name: String,
+    pub value: AcpAgentEnvValue,
+}
+
+/// Per-device confirmation state for commands that can execute local code.
+///
+/// ACP command settings are intentionally local-only for now. This state gives the runner/UI a
+/// place to record that a user confirmed the exact argv on this device before launch.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Per-device launch confirmation for an ACP agent.")]
+pub struct AcpAgentLocalConfirmation {
+    #[serde(default)]
+    pub confirmed_on_this_device: bool,
+    #[serde(default)]
+    pub confirmed_at: Option<String>,
+}
+
+/// User-configurable local ACP agent.
+///
+/// Commands are split into `command` + `args` so the runner can launch with
+/// `Command::new(command).args(args)` instead of shell interpolation.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Configuration for a local Agent Client Protocol agent.")]
+pub struct AcpAgentConfig {
+    pub id: AcpAgentId,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<AcpAgentEnvVar>,
+    /// MCP server IDs explicitly allowed for this agent.
+    #[serde(default)]
+    pub mcp_allowlist: Vec<String>,
+    #[serde(default)]
+    pub install_url: Option<String>,
+    #[serde(default)]
+    pub registry_key: Option<String>,
+    #[serde(default)]
+    pub local_confirmation: AcpAgentLocalConfirmation,
+}
+
+impl AcpAgentConfig {
+    pub fn from_registry_entry(entry: &AcpAgentRegistryEntry) -> Self {
+        Self {
+            id: AcpAgentId::new(entry.registry_key),
+            name: entry.name.to_owned(),
+            command: entry.command.command.to_owned(),
+            args: entry
+                .command
+                .args
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            env: Vec::new(),
+            mcp_allowlist: Vec::new(),
+            install_url: Some(entry.install_url.to_owned()),
+            registry_key: Some(entry.registry_key.to_owned()),
+            local_confirmation: AcpAgentLocalConfirmation::default(),
+        }
+    }
+}
+
+/// A command template in the curated ACP registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpAgentCommandTemplate {
+    pub command: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// Curated seed metadata for known ACP agents. Registry entries are not executed directly;
+/// users still confirm a concrete argv on each device before launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpAgentRegistryEntry {
+    pub registry_key: &'static str,
+    pub name: &'static str,
+    pub command: AcpAgentCommandTemplate,
+    pub fallback_command: Option<AcpAgentCommandTemplate>,
+    pub install_url: &'static str,
+}
+
+pub const KNOWN_ACP_AGENTS: &[AcpAgentRegistryEntry] = &[
+    AcpAgentRegistryEntry {
+        registry_key: "opencode",
+        name: "OpenCode (ACP)",
+        command: AcpAgentCommandTemplate {
+            command: "opencode",
+            args: &["acp"],
+        },
+        fallback_command: None,
+        install_url: "https://opencode.ai",
+    },
+    AcpAgentRegistryEntry {
+        registry_key: "codex-acp",
+        name: "Codex (ACP)",
+        command: AcpAgentCommandTemplate {
+            command: "codex-acp",
+            args: &[],
+        },
+        fallback_command: Some(AcpAgentCommandTemplate {
+            command: "npx",
+            args: &["-y", "@zed-industries/codex-acp"],
+        }),
+        install_url: "https://github.com/zed-industries/codex-acp/releases",
+    },
+];
+
 define_settings_group!(AISettings, settings: [
     // If `false`, all AI features are disabled.
     is_any_ai_enabled: IsAnyAIEnabled {
@@ -1279,6 +1485,18 @@ define_settings_group!(AISettings, settings: [
         description: "Maps custom toolbar command patterns to specific CLI agents.",
     }
 
+    // Configured ACP agents. Local-only until the runner can require per-device confirmation
+    // before launching synced command/argv/env values.
+    acp_agent_configs: AcpAgentConfigs {
+        type: Vec<AcpAgentConfig>,
+        default: Vec::new(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.third_party.acp_agents",
+        description: "Local Agent Client Protocol agents that Warp can launch.",
+    }
+
     // This is not a user-visible setting - it tracks whether a paid user has dismissed the
     // agent management help page by clicking "View Agents".
     //
@@ -1463,6 +1681,30 @@ define_settings_group!(AISettings, settings: [
 ]);
 
 impl AISettings {
+    /// Curated ACP registry entries that can seed user-configured agents.
+    pub fn known_acp_agent_registry() -> &'static [AcpAgentRegistryEntry] {
+        if FeatureFlag::AcpClient.is_enabled() {
+            KNOWN_ACP_AGENTS
+        } else {
+            &[]
+        }
+    }
+
+    /// Returns configured ACP agents when ACP client support is enabled.
+    pub fn configured_acp_agents(&self) -> &[AcpAgentConfig] {
+        if FeatureFlag::AcpClient.is_enabled() {
+            self.acp_agent_configs.value()
+        } else {
+            &[]
+        }
+    }
+
+    pub fn acp_agent_config(&self, id: &AcpAgentId) -> Option<&AcpAgentConfig> {
+        self.configured_acp_agents()
+            .iter()
+            .find(|config| &config.id == id)
+    }
+
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {
         Self::register(app);
         app.add_singleton_model(FocusedTerminalInfo::new);
