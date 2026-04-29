@@ -12,14 +12,23 @@
 //! shapes needed by the approved plan. It avoids `deny_unknown_fields` so Warp can
 //! remain forward-compatible with non-breaking ACP additions.
 
+mod client;
 mod command;
+mod jsonrpc;
 mod registry;
 pub mod schema;
+mod transport;
 
+pub use client::{AcpClient, AcpClientError};
 pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
-pub use registry::{codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent};
+pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
+pub use registry::{
+    codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,
+};
 pub use schema::{
     conservative_initialize_request, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    Implementation, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
-    ProtocolVersion, SessionId, TextContent,
+    Implementation, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
+    SessionId, StopReason, TextContent,
 };
+pub use transport::{JsonRpcStdioTransport, JsonRpcTransportError};

@@ -1,0 +1,315 @@
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::command::{AcpAgentCommand, AcpCommandError};
+use crate::jsonrpc::{
+    decode_frame, encode_frame, AgentMessage, IncomingFrame, JsonRpcErrorObject,
+    JsonRpcErrorResponse, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcResult,
+};
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+type PendingSender = mpsc::Sender<Result<Value, JsonRpcErrorObject>>;
+
+#[derive(Debug, Error)]
+pub enum JsonRpcTransportError {
+    #[error("failed to validate ACP command: {0}")]
+    Command(#[from] AcpCommandError),
+    #[error("failed to spawn ACP agent: {0}")]
+    Spawn(std::io::Error),
+    #[error("ACP agent subprocess did not expose piped stdio")]
+    MissingPipe,
+    #[error("failed to encode JSON-RPC frame: {0}")]
+    Encode(serde_json::Error),
+    #[error("failed to decode JSON-RPC frame: {0}")]
+    Decode(serde_json::Error),
+    #[error("failed to write JSON-RPC frame: {0}")]
+    Write(std::io::Error),
+    #[error("ACP request `{method}` timed out after {timeout:?}")]
+    Timeout { method: String, timeout: Duration },
+    #[error("ACP transport closed before response")]
+    Closed,
+    #[error("ACP agent returned error {code}: {message}")]
+    RemoteError {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+}
+
+pub struct JsonRpcStdioTransport {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
+    inbound_rx: Mutex<mpsc::Receiver<AgentMessage>>,
+    next_request_id: AtomicU64,
+    child: Mutex<Option<Child>>,
+}
+
+impl JsonRpcStdioTransport {
+    pub fn spawn(config: &AcpAgentCommand) -> Result<Self, JsonRpcTransportError> {
+        let mut command = config.to_std_command()?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(JsonRpcTransportError::Spawn)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(JsonRpcTransportError::MissingPipe)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(JsonRpcTransportError::MissingPipe)?;
+        Ok(Self::from_reader_writer(stdout, stdin, Some(child)))
+    }
+
+    pub fn from_reader_writer<R, W>(reader: R, writer: W, child: Option<Child>) -> Self
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(writer)));
+        let pending: Arc<Mutex<HashMap<u64, PendingSender>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (inbound_tx, inbound_rx) = mpsc::channel();
+        let pending_for_thread = Arc::clone(&pending);
+
+        thread::spawn(move || {
+            let reader = BufReader::new(reader);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match decode_frame(&line) {
+                    Ok(IncomingFrame::Response { id, result }) => {
+                        if let Some(tx) = pending_for_thread
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.remove(&id))
+                        {
+                            let _ = tx.send(result);
+                        }
+                    }
+                    Ok(IncomingFrame::AgentMessage(message)) => {
+                        let _ = inbound_tx.send(message);
+                    }
+                    Err(error) => {
+                        let _ = inbound_tx.send(AgentMessage::Notification {
+                            method: "$/warp/malformedFrame".to_string(),
+                            params: Value::String(error.to_string()),
+                        });
+                    }
+                }
+            }
+        });
+
+        Self {
+            writer,
+            pending,
+            inbound_rx: Mutex::new(inbound_rx),
+            next_request_id: AtomicU64::new(1),
+            child: Mutex::new(child),
+        }
+    }
+
+    pub fn request<P, R>(&self, method: &str, params: P) -> Result<R, JsonRpcTransportError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        self.request_timeout(method, params, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    pub fn request_timeout<P, R>(
+        &self,
+        method: &str,
+        params: P,
+        timeout: Duration,
+    ) -> Result<R, JsonRpcTransportError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .expect("pending poisoned")
+            .insert(id, tx);
+
+        let frame = JsonRpcRequest::new(JsonRpcId::Number(id), method, params);
+        if let Err(error) = self.write_frame(&frame) {
+            self.pending.lock().expect("pending poisoned").remove(&id);
+            return Err(error);
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(value)) => serde_json::from_value(value).map_err(JsonRpcTransportError::Decode),
+            Ok(Err(error)) => Err(JsonRpcTransportError::RemoteError {
+                code: error.code,
+                message: error.message,
+                data: error.data,
+            }),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.pending.lock().expect("pending poisoned").remove(&id);
+                Err(JsonRpcTransportError::Timeout {
+                    method: method.to_string(),
+                    timeout,
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(JsonRpcTransportError::Closed),
+        }
+    }
+
+    pub fn notify<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<(), JsonRpcTransportError> {
+        self.write_frame(&JsonRpcNotification::new(method, params))
+    }
+
+    pub fn respond_result<R: Serialize>(
+        &self,
+        id: JsonRpcId,
+        result: R,
+    ) -> Result<(), JsonRpcTransportError> {
+        self.write_frame(&JsonRpcResult::new(id, result))
+    }
+
+    pub fn respond_error(
+        &self,
+        id: JsonRpcId,
+        error: JsonRpcErrorObject,
+    ) -> Result<(), JsonRpcTransportError> {
+        self.write_frame(&JsonRpcErrorResponse::new(id, error))
+    }
+
+    pub fn recv_message(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<AgentMessage>, JsonRpcTransportError> {
+        match self
+            .inbound_rx
+            .lock()
+            .expect("inbound poisoned")
+            .recv_timeout(timeout)
+        {
+            Ok(message) => Ok(Some(message)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(JsonRpcTransportError::Closed),
+        }
+    }
+
+    pub fn kill_child(&self) -> Result<(), std::io::Error> {
+        if let Some(child) = self.child.lock().expect("child poisoned").as_mut() {
+            child.kill()?;
+        }
+        Ok(())
+    }
+
+    fn write_frame<T: Serialize>(&self, frame: &T) -> Result<(), JsonRpcTransportError> {
+        let bytes = encode_frame(frame).map_err(JsonRpcTransportError::Encode)?;
+        let mut writer = self.writer.lock().expect("writer poisoned");
+        writer
+            .write_all(&bytes)
+            .map_err(JsonRpcTransportError::Write)?;
+        writer.flush().map_err(JsonRpcTransportError::Write)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Write};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_correlates_response_by_id() {
+        let input = Cursor::new(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}
+"#
+            .to_vec(),
+        );
+        let output = SharedWriter::default();
+        let captured = Arc::clone(&output.0);
+        let transport = JsonRpcStdioTransport::from_reader_writer(input, output, None);
+
+        let result: serde_json::Value = transport
+            .request_timeout("initialize", json!({}), Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(result, json!({"ok": true}));
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains("initialize"));
+        assert!(written.ends_with('\n'));
+    }
+
+    #[test]
+    fn receives_agent_notifications() {
+        let input = Cursor::new(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s"}}
+"#
+            .to_vec(),
+        );
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(input, SharedWriter::default(), None);
+
+        let message = transport
+            .recv_message(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            message,
+            AgentMessage::Notification {
+                method: "session/update".to_string(),
+                params: json!({"sessionId": "s"}),
+            }
+        );
+    }
+
+    #[test]
+    fn request_times_out_and_clears_pending_entry() {
+        let transport = JsonRpcStdioTransport::from_reader_writer(
+            Cursor::new(Vec::new()),
+            SharedWriter::default(),
+            None,
+        );
+
+        let error = transport
+            .request_timeout::<_, Value>("initialize", json!({}), Duration::from_millis(5))
+            .unwrap_err();
+
+        assert!(matches!(error, JsonRpcTransportError::Timeout { .. }));
+        assert!(transport.pending.lock().unwrap().is_empty());
+    }
+}

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Stable ACP protocol version identifier.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -150,7 +151,10 @@ pub struct InitializeRequest {
 
 impl InitializeRequest {
     #[must_use]
-    pub fn new(client_info: Option<Implementation>, client_capabilities: ClientCapabilities) -> Self {
+    pub fn new(
+        client_info: Option<Implementation>,
+        client_capabilities: ClientCapabilities,
+    ) -> Self {
         Self {
             protocol_version: ProtocolVersion::LATEST,
             client_capabilities,
@@ -165,6 +169,19 @@ pub fn conservative_initialize_request(client_name: impl Into<String>) -> Initia
         Some(Implementation::new(client_name.into())),
         ClientCapabilities::conservative(),
     )
+}
+
+/// ACP `initialize` response returned by the agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeResponse {
+    pub protocol_version: ProtocolVersion,
+    #[serde(default)]
+    pub agent_capabilities: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_info: Option<Implementation>,
+    #[serde(default)]
+    pub auth_methods: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -238,6 +255,15 @@ impl NewSessionRequest {
     }
 }
 
+/// ACP `session/new` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSessionResponse {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub available_modes: Vec<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextContent {
     pub text: String,
@@ -261,6 +287,25 @@ impl ContentBlock {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(TextContent::new(text))
     }
+}
+
+/// ACP prompt stop reason. Unknown future values are preserved as strings at the
+/// serde boundary by callers that need more detail; v1 code only branches on
+/// cancellation versus completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    Cancelled,
+    MaxTokens,
+    Refusal,
+}
+
+/// ACP `session/prompt` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptResponse {
+    pub stop_reason: StopReason,
 }
 
 /// ACP `session/prompt` request.

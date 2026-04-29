@@ -100,7 +100,9 @@ impl AcpAgentCommand {
 pub enum AcpCommandError {
     #[error("ACP agent command cannot be empty")]
     EmptyCommand,
-    #[error("ACP agent command `{command}` would evaluate a shell string; use argv-only command/args")]
+    #[error(
+        "ACP agent command `{command}` would evaluate a shell string; use argv-only command/args"
+    )]
     ShellEvaluationNotAllowed { command: String },
     #[error("ACP agent environment variable name `{0}` is invalid")]
     InvalidEnvironmentName(String),
@@ -134,7 +136,10 @@ mod tests {
             .args(["acp"])
             .env([AcpEnvironmentVariable::new("RUST_LOG", "info")]);
 
-        assert_eq!(command.display_argv(), vec!["opencode".to_string(), "acp".to_string()]);
+        assert_eq!(
+            command.display_argv(),
+            vec!["opencode".to_string(), "acp".to_string()]
+        );
         assert!(command.to_std_command().is_ok());
     }
 
