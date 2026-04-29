@@ -63,11 +63,17 @@ pub struct Implementation {
 
 impl Implementation {
     #[must_use]
-    pub fn new(name: impl Into<String>, version: impl Into<Option<String>>) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            version: version.into(),
+            version: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 }
 
@@ -156,7 +162,7 @@ impl InitializeRequest {
 #[must_use]
 pub fn conservative_initialize_request(client_name: impl Into<String>) -> InitializeRequest {
     InitializeRequest::new(
-        Some(Implementation::new(client_name.into(), None)),
+        Some(Implementation::new(client_name.into())),
         ClientCapabilities::conservative(),
     )
 }
@@ -176,12 +182,35 @@ impl SessionId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpServer {
-    Stdio {
-        name: String,
-        command: PathBuf,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        args: Vec<String>,
-    },
+    /// Stdio is untagged in the official ACP schema because every agent must support it.
+    #[serde(untagged)]
+    Stdio(McpServerStdio),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStdio {
+    pub name: String,
+    pub command: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl McpServerStdio {
+    #[must_use]
+    pub fn new(name: impl Into<String>, command: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// ACP `session/new` request.

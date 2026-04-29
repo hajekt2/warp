@@ -20,6 +20,6 @@ pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
 pub use registry::{codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent};
 pub use schema::{
     conservative_initialize_request, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    Implementation, InitializeRequest, McpServer, NewSessionRequest, PromptRequest,
+    Implementation, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
     ProtocolVersion, SessionId, TextContent,
 };
