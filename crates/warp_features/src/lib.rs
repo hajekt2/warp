@@ -835,6 +835,11 @@ pub enum FeatureFlag {
     VerticalTabsSummaryMode,
 
     CloudModeInputV2,
+
+    /// When enabled, locks the agent-view input to AI/NL mode whenever a
+    /// locking attachment (e.g. image, file, or block) is present, bypassing
+    /// the natural language detection classifier for those inputs.
+    LockInteractionsToNLMode,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
