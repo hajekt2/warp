@@ -40,9 +40,9 @@ pub(crate) mod claude_transcript;
 mod gemini;
 mod json_utils;
 
+use acp::AcpHarness;
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
-use acp::AcpHarness;
 use gemini::GeminiHarness;
 
 /// Harness-agnostic payload describing how to resume an existing conversation.
@@ -172,7 +172,9 @@ pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverE
         Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
         Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
         Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
-        Harness::Acp if FeatureFlag::AcpClient.is_enabled() => Ok(HarnessKind::Acp(AcpHarness::new())),
+        Harness::Acp if FeatureFlag::AcpClient.is_enabled() => {
+            Ok(HarnessKind::Acp(AcpHarness::new()))
+        }
         Harness::Acp => Ok(HarnessKind::Unsupported(Harness::Acp)),
         Harness::Unknown => Err(AgentDriverError::InvalidRuntimeState),
     }

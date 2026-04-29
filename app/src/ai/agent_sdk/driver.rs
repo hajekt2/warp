@@ -1291,7 +1291,9 @@ impl AgentDriver {
                             .await?,
                     )
                 }
-                HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => None,
+                HarnessKind::Acp(_) | HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => {
+                    None
+                }
             };
 
             let harness = task.harness.harness();
@@ -1380,7 +1382,7 @@ impl AgentDriver {
                         log::warn!("Failed to load environment repo skills: {err}");
                     }
                 }
-                HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => {}
+                HarnessKind::Acp(_) | HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => {}
             }
         }
 
@@ -1412,6 +1414,7 @@ impl AgentDriver {
                     Self::prepare_harness(&task.prompt, harness.as_ref(), &foreground).await?;
                 Self::run_harness(runner, &foreground, harness_exit_rx).await
             }
+            HarnessKind::Acp(harness) => Err(harness.setup_error()),
             HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
                 harness: harness.to_string(),
                 reason: format!(

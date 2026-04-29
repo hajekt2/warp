@@ -253,6 +253,9 @@ fn run_agent(
             if args.skill.is_some() && !FeatureFlag::OzPlatformSkills.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--skill' found"));
             }
+            if args.harness == Harness::Acp && !FeatureFlag::AcpClient.is_enabled() {
+                return Err(anyhow::anyhow!("unexpected argument '--harness acp' found"));
+            }
             if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
             }
@@ -296,6 +299,9 @@ fn run_agent(
                 return Err(anyhow::anyhow!(
                     "unexpected argument '--conversation' found"
                 ));
+            }
+            if args.harness == Harness::Acp && !FeatureFlag::AcpClient.is_enabled() {
+                return Err(anyhow::anyhow!("unexpected argument '--harness acp' found"));
             }
             if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
@@ -632,6 +638,9 @@ impl AgentDriverRunner {
             }
 
             match &task.harness {
+                HarnessKind::Acp(harness) => {
+                    return Err(harness.setup_error());
+                }
                 HarnessKind::Unsupported(harness) => {
                     return Err(AgentDriverError::HarnessSetupFailed {
                         harness: harness.to_string(),
@@ -1154,6 +1163,7 @@ impl AgentDriverRunner {
                         .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))),
                 )
             }
+            HarnessKind::Acp(harness) => Err(harness.setup_error()),
             HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
                 harness: harness.to_string(),
                 reason: format!(
@@ -1389,6 +1399,7 @@ fn resolve_orchestration_harness_label() -> &'static str {
         Some(Harness::Claude) => "claude",
         Some(Harness::OpenCode) => "opencode",
         Some(Harness::Gemini) => "gemini",
+        Some(Harness::Acp) => "acp",
         Some(Harness::Unknown) | None => "unknown",
     }
 }
