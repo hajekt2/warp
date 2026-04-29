@@ -29,6 +29,7 @@ use crate::ai::agent::AIAgentExchangeId;
 use crate::ai::agent::CancellationReason;
 use crate::ai::artifacts::Artifact;
 use crate::ai::document::ai_document_model::AIDocumentModel;
+use crate::ai::llms::LLMPreferences;
 use crate::input_suggestions::HistoryOrder;
 use crate::persistence::model::AgentConversationData;
 use crate::persistence::ModelEvent;
@@ -40,7 +41,7 @@ use crate::{
     ai::agent::{
         conversation::{AIConversation, AIConversationId},
         AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutputStatus, FinishedAIAgentOutput,
-        MessageId, RenderableAIError, RequestCost, Suggestions,
+        MessageId, RenderableAIError, RequestCost, Suggestions, UserQueryMode,
     },
     persistence::model::AgentConversation,
     ui_components::icons::Icon,
@@ -788,6 +789,63 @@ impl BlocklistAIHistoryModel {
         });
 
         new_conversation_id
+    }
+
+    pub fn append_finished_acp_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        prompt: String,
+        output_text: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<AIConversationId, UpdateHistoryError> {
+        let conversation_id = self.start_new_conversation(terminal_view_id, false, false, ctx);
+        self.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
+
+        let llm_prefs = LLMPreferences::as_ref(ctx);
+        let model_id = llm_prefs
+            .get_active_base_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let coding_model_id = llm_prefs
+            .get_active_coding_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let cli_agent_model_id = llm_prefs
+            .get_active_cli_agent_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let computer_use_model_id = llm_prefs
+            .get_active_computer_use_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+
+        let input = vec![AIAgentInput::UserQuery {
+            query: prompt,
+            context: Default::default(),
+            static_query_type: None,
+            referenced_attachments: Default::default(),
+            user_query_mode: UserQueryMode::default(),
+            running_command: None,
+            intended_agent: None,
+        }];
+
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        conversation.append_finished_text_exchange(
+            input,
+            output_text,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(conversation_id)
     }
 
     pub fn create_cli_subagent_task_for_conversation(

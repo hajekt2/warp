@@ -3,6 +3,7 @@ use crate::ai::agent::linearization::compute_task_depths;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::{RequestInput, ResponseStreamId, SerializedBlockListItem};
+use crate::ai::llms::LLMId;
 use crate::ai::skills::SkillDescriptor;
 use crate::code_review::CodeReviewTelemetryEvent;
 use crate::notebooks::NotebookId;
@@ -2600,6 +2601,68 @@ impl AIConversation {
         self.task_store
             .exchange_mut(exchange_id)
             .ok_or(UpdateConversationError::ExchangeNotFound)
+    }
+
+    pub(crate) fn append_finished_text_exchange(
+        &mut self,
+        input: Vec<AIAgentInput>,
+        output_text: String,
+        working_directory: Option<String>,
+        model_id: LLMId,
+        coding_model_id: LLMId,
+        cli_agent_model_id: LLMId,
+        computer_use_model_id: LLMId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<AIAgentExchangeId, UpdateConversationError> {
+        let exchange_id = AIAgentExchangeId::new();
+        let task_id = self.get_root_task_id().clone();
+        let output = AIAgentOutput {
+            messages: vec![AIAgentOutputMessage::text(
+                MessageId::new(Uuid::new_v4().to_string()),
+                api::message::AgentOutput { text: output_text }.into(),
+            )],
+            ..Default::default()
+        };
+        let now = Local::now();
+        let exchange = AIAgentExchange {
+            id: exchange_id,
+            input,
+            output_status: AIAgentOutputStatus::Finished {
+                finished_output: FinishedAIAgentOutput::Success {
+                    output: Shared::new(output),
+                },
+            },
+            added_message_ids: HashSet::new(),
+            start_time: now,
+            finish_time: Some(now),
+            time_to_first_token_ms: None,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            request_cost: None,
+            response_initiator: None,
+        };
+
+        self.append_exchange_to_task(&task_id, exchange)?;
+        ctx.emit(BlocklistAIHistoryEvent::AppendedExchange {
+            exchange_id,
+            task_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+            response_stream_id: None,
+        });
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+        });
+        self.update_status(ConversationStatus::Success, terminal_view_id, ctx);
+        Ok(exchange_id)
     }
 
     pub fn get_root_task(&self) -> Option<&Task> {

@@ -77,8 +77,9 @@ use futures::{
     FutureExt as _,
 };
 use oneshot::{Canceled, Receiver, Sender};
+use serde_json::Value;
 use uuid::Uuid;
-use warp_acp::{AcpClient, ContentBlock, NewSessionRequest};
+use warp_acp::{AcpClient, AgentMessage, ContentBlock, NewSessionRequest};
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
 use warp_cli::share::ShareRequest;
@@ -1439,7 +1440,7 @@ impl AgentDriver {
         foreground: &ModelSpawner<Self>,
     ) -> Result<(), AgentDriverError> {
         let selected_agent_id = harness.agent_id().cloned();
-        let (working_dir, config, server_api) = foreground
+        let (terminal_view_id, working_dir, config, server_api) = foreground
             .spawn(move |me, ctx| {
                 let settings = AISettings::as_ref(ctx);
                 let config = match selected_agent_id.as_ref() {
@@ -1459,6 +1460,7 @@ impl AgentDriver {
                         })?,
                 };
                 Ok::<_, AgentDriverError>((
+                    me.terminal_driver.as_ref(ctx).terminal_view().id(),
                     me.working_dir.clone(),
                     config,
                     ServerApiProvider::as_ref(ctx).get_harness_support_client(),
@@ -1492,23 +1494,99 @@ impl AgentDriver {
             .to_launch_command()
             .map_err(AgentDriverError::ConfigBuildFailed)?;
         let prompt = prompt_text.into_owned();
-        tokio::task::spawn_blocking(move || {
+        let prompt_for_history = prompt.clone();
+        let working_dir_for_history = working_dir.clone();
+        let output_text = tokio::task::spawn_blocking(move || {
             let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
             client.initialize("Warp").map_err(anyhow::Error::from)?;
             let session = client
                 .new_session(NewSessionRequest::new(working_dir))
                 .map_err(anyhow::Error::from)?;
+            let output = Arc::new(Mutex::new(String::new()));
+            let output_for_handler = Arc::clone(&output);
             client
-                .prompt_with_conservative_request_handling(
+                .prompt_with_agent_message_handler(
                     session.session_id,
                     vec![ContentBlock::text(prompt)],
+                    move |message| {
+                        if let Some(text) = Self::acp_message_text(&message) {
+                            let mut output =
+                                output_for_handler.lock().expect("ACP output poisoned");
+                            output.push_str(&text);
+                        }
+                    },
                 )
                 .map_err(anyhow::Error::from)?;
-            Ok::<_, anyhow::Error>(())
+            let output = output.lock().expect("ACP output poisoned").clone();
+            Ok::<_, anyhow::Error>(output)
         })
         .await
         .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?
-        .map_err(AgentDriverError::ConfigBuildFailed)
+        .map_err(AgentDriverError::ConfigBuildFailed)?;
+
+        let output_text = if output_text.trim().is_empty() {
+            "ACP agent completed without streamed text output.".to_string()
+        } else {
+            output_text
+        };
+        foreground
+            .spawn(move |_, ctx| {
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                    history.append_finished_acp_exchange(
+                        terminal_view_id,
+                        prompt_for_history,
+                        output_text,
+                        Some(working_dir_for_history.display().to_string()),
+                        ctx,
+                    )
+                })
+            })
+            .await?
+            .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
+        Ok(())
+    }
+
+    fn acp_message_text(message: &AgentMessage) -> Option<String> {
+        let AgentMessage::Notification { method, params } = message else {
+            return None;
+        };
+        if method != "session/update" {
+            return None;
+        }
+        let mut text = String::new();
+        Self::collect_acp_text(params, &mut text);
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn collect_acp_text(value: &Value, output: &mut String) {
+        match value {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        output.push_str(text);
+                        return;
+                    }
+                }
+                // ACP implementations differ slightly in where they put streaming text
+                // (`content`, `delta`, nested update objects). Conservatively scan known
+                // JSON values and only copy string fields named `text`.
+                if let Some(text) = map.get("text").and_then(Value::as_str) {
+                    output.push_str(text);
+                }
+                for (key, nested) in map {
+                    if key == "text" {
+                        continue;
+                    }
+                    Self::collect_acp_text(nested, output);
+                }
+            }
+            Value::Array(values) => {
+                for nested in values {
+                    Self::collect_acp_text(nested, output);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Sets up the third-party harness by subscribing to CLI session events and
