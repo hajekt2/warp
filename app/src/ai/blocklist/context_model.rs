@@ -377,7 +377,14 @@ impl BlocklistAIContextModel {
     /// Pending selected text is intentionally excluded because users can select shell command
     /// text (e.g. to copy a previously-run command), and that should not lock the input to AI
     /// mode.
+    ///
+    /// Gated by [`FeatureFlag::LockInteractionsToNLMode`]: when the flag is disabled this
+    /// method always returns `false`, so all callers (force-lock branches in the input model,
+    /// defense-in-depth autodetection guards) fall back to the pre-flag behavior.
     pub fn has_locking_attachment(&self) -> bool {
+        if !FeatureFlag::LockInteractionsToNLMode.is_enabled() {
+            return false;
+        }
         self.pending_image_attachments_in_progress > 0
             || !self.pending_context_block_ids.is_empty()
             || !self.pending_attachments.is_empty()

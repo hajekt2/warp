@@ -55,7 +55,14 @@ const AUTODETECTION_DISABLE_DURATION_MS: u64 = 250;
 /// shell mode after pasting an image).
 ///
 /// Pattern C (RefineDiff) will be added here in a follow-up commit.
+///
+/// Gated by [`FeatureFlag::LockInteractionsToNLMode`]: when the flag is disabled this helper
+/// always returns `false`, so the force-lock branch in the `EnteredAgentView` subscriber falls
+/// through to the pre-flag autodetection-based behavior.
 fn origin_requires_locked_ai(origin: &AgentViewEntryOrigin) -> bool {
+    if !FeatureFlag::LockInteractionsToNLMode.is_enabled() {
+        return false;
+    }
     matches!(origin, AgentViewEntryOrigin::ImageAdded)
 }
 

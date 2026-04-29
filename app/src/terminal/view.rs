@@ -3315,9 +3315,14 @@ impl TerminalView {
         // model can consult `has_locking_attachment` for force-locking decisions (image attached,
         // file attached, block context, etc.). The input model is constructed first because it
         // owns lock state that the context model never reads.
-        ai_input_model.update(ctx, |ai_input_model, _| {
-            ai_input_model.set_ai_context_model(ai_context_model.clone());
-        });
+        //
+        // Gated by `FeatureFlag::LockInteractionsToNLMode`: when the flag is disabled we skip
+        // the wiring entirely so the input model never consults the context model for locking.
+        if FeatureFlag::LockInteractionsToNLMode.is_enabled() {
+            ai_input_model.update(ctx, |ai_input_model, _| {
+                ai_input_model.set_ai_context_model(ai_context_model.clone());
+            });
+        }
         let ai_controller = ctx.add_model(|ctx| {
             BlocklistAIController::new(
                 ai_input_model.clone(),

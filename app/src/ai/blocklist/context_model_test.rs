@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
+use warp_core::features::FeatureFlag;
 use warpui::r#async::executor::Background;
 use warpui::{App, EntityId, ModelHandle};
 
@@ -86,6 +87,7 @@ fn make_file_attachment(file_name: &str) -> PendingAttachment {
 #[test]
 fn has_locking_attachment_is_false_for_default_state() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.read(&app, |m, _| {
@@ -96,8 +98,31 @@ fn has_locking_attachment_is_false_for_default_state() {
 }
 
 #[test]
+fn has_locking_attachment_is_false_when_flag_is_disabled() {
+    // When `LockInteractionsToNLMode` is disabled, `has_locking_attachment` must always return
+    // `false` regardless of pending blocks/attachments/in-progress images, so callers fall back
+    // to the pre-flag NLD-based behavior.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(false);
+        let model = build_test_context_model(&mut app);
+
+        model.update(&mut app, |m, ctx| {
+            m.insert_pending_block_id_for_test(BlockId::new());
+            m.append_pending_attachments_for_test(vec![
+                make_image_attachment("a.png"),
+                make_file_attachment("notes.txt"),
+            ]);
+            m.note_image_attachment_started(ctx);
+        });
+
+        model.read(&app, |m, _| assert!(!m.has_locking_attachment()));
+    });
+}
+
+#[test]
 fn has_locking_attachment_is_true_with_pending_block_id() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, _| {
@@ -115,6 +140,7 @@ fn has_locking_attachment_is_false_with_only_pending_selected_text() {
     // mode in that case would be wrong. Only images, files, blocks, or in-progress
     // image-attach pipelines should force the lock.
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, _| {
@@ -128,6 +154,7 @@ fn has_locking_attachment_is_false_with_only_pending_selected_text() {
 #[test]
 fn has_locking_attachment_is_true_with_pending_image_attachment() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, _| {
@@ -143,6 +170,7 @@ fn has_locking_attachment_is_true_with_only_file_attachments() {
     // File attachments are locking attachments — the user has explicitly attached a file as
     // context, which is unambiguously a signal that the next query is intended for the agent.
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, _| {
@@ -159,6 +187,7 @@ fn has_locking_attachment_is_true_with_only_file_attachments() {
 #[test]
 fn has_locking_attachment_is_true_with_mixed_image_and_file_attachments() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, _| {
@@ -175,6 +204,7 @@ fn has_locking_attachment_is_true_with_mixed_image_and_file_attachments() {
 #[test]
 fn note_image_attachment_started_increments_counter_and_locks_input() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, ctx| m.note_image_attachment_started(ctx));
@@ -192,6 +222,7 @@ fn note_image_attachment_started_increments_counter_and_locks_input() {
 #[test]
 fn note_image_attachment_completed_decrements_counter_and_unlocks_input() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, ctx| {
@@ -209,6 +240,7 @@ fn note_image_attachment_completed_decrements_counter_and_unlocks_input() {
 #[test]
 fn note_image_attachment_started_supports_multiple_concurrent_pipelines() {
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, ctx| {
@@ -245,6 +277,7 @@ fn note_image_attachment_completed_saturates_at_zero() {
     // Defensive: a stray `_completed` without a matching `_started` (or a double-completion) must
     // not underflow `usize` and silently lock the input forever.
     App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::LockInteractionsToNLMode.override_enabled(true);
         let model = build_test_context_model(&mut app);
 
         model.update(&mut app, |m, ctx| {
