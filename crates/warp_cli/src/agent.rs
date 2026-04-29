@@ -134,6 +134,9 @@ pub enum Harness {
     /// Delegate to the `gemini` CLI.
     #[value(name = "gemini")]
     Gemini,
+    /// Use a configured Agent Client Protocol (ACP) agent.
+    #[value(name = "acp")]
+    Acp,
     /// A harness produced by a newer client/server that this client doesn't
     /// recognize. Surfaced via deserialization fallbacks (e.g. unknown GraphQL
     /// enum values, unknown `harness_type` strings); never selectable from the
@@ -151,7 +154,7 @@ impl Harness {
     pub fn parse_local_child_harness(value: &str) -> Option<Self> {
         match Self::parse_orchestration_harness(value) {
             Some(harness @ (Self::Claude | Self::OpenCode)) => Some(harness),
-            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Unknown) | None => None,
+            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Acp) | Some(Self::Unknown) | None => None,
         }
     }
 
@@ -161,6 +164,7 @@ impl Harness {
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
+            Self::Acp => "ACP",
             Self::Unknown => "Unknown",
         }
     }
@@ -173,6 +177,7 @@ impl fmt::Display for Harness {
             Harness::Claude => "claude",
             Harness::OpenCode => "opencode",
             Harness::Gemini => "gemini",
+            Harness::Acp => "acp",
             Harness::Unknown => "unknown",
         };
         f.write_str(name)
