@@ -166,7 +166,7 @@ impl InitializeRequest {
 #[must_use]
 pub fn conservative_initialize_request(client_name: impl Into<String>) -> InitializeRequest {
     InitializeRequest::new(
-        Some(Implementation::new(client_name.into())),
+        Some(Implementation::new(client_name.into()).with_version(env!("CARGO_PKG_VERSION"))),
         ClientCapabilities::conservative(),
     )
 }
@@ -340,6 +340,7 @@ mod tests {
         assert_eq!(value["clientCapabilities"]["fs"]["writeTextFile"], false);
         assert_eq!(value["clientCapabilities"]["terminal"], false);
         assert_eq!(value["clientInfo"]["name"], "Warp");
+        assert_eq!(value["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

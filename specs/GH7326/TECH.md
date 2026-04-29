@@ -38,4 +38,4 @@ Warp initially advertises conservative capabilities. `fs`, `terminal`, and MCP f
 - Settings tests for serialization, feature gating, and local-only ACP config storage.
 - UI model/selector tests for built-in and configured ACP entries.
 - Integration fixture binary for ACP initialize/session/new/session/prompt echo.
-- Manual matrix: `opencode acp`, `codex-acp`, missing command, crash during handshake, MCP allowlist with redaction.
+- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, MCP allowlist with redaction.

@@ -917,7 +917,7 @@ pub const KNOWN_ACP_AGENTS: &[AcpAgentRegistryEntry] = &[
         name: "OpenCode (ACP)",
         command: AcpAgentCommandTemplate {
             command: "opencode",
-            args: &["acp"],
+            args: &["acp", "--port", "0"],
         },
         fallback_command: None,
         install_url: "https://opencode.ai",

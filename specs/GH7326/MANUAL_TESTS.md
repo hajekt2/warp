@@ -25,8 +25,11 @@ Result on 2026-04-29: passed handshake. The wrapper returned protocol version `1
 Command:
 
 ```bash
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"Warp smoke"}}}' \
-  | timeout 8 opencode acp
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"Warp smoke","version":"0.1.0"}}}' \
+  | timeout 8 opencode acp --port 0 --pure
 ```
 
-Result on 2026-04-29: blocked locally before handshake because OpenCode failed to start its server on port `4096`. The log was written to `~/.local/share/opencode/log/2026-04-29T220517.log`. Re-test after freeing/configuring that port.
+Result on 2026-04-29: passed handshake with OpenCode `1.14.29`. OpenCode returned protocol version `1`, `agentInfo.name = "OpenCode"`, `agentInfo.version = "1.14.29"`, and auth instructions. Two local compatibility findings were captured:
+
+- Bare `opencode acp` failed before handshake because a long-running orphaned `/home/haja/.npm-global/lib/node_modules/opencode-ai/bin/.opencode serve` process was already listening on `0.0.0.0:4096` (PID `834381`, parent `1`). The Warp registry seeds OpenCode as `opencode acp --port 0` so ACP gets an ephemeral HTTP port and avoids collisions with existing OpenCode servers.
+- OpenCode rejects `initialize` when `clientInfo.version` is omitted (`-32602 Invalid params`). Warp's conservative initialize request includes the `warp_acp` crate version for ACP schema compatibility.

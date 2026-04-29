@@ -356,7 +356,7 @@ fn test_acp_agent_registry_contains_seed_agents() {
         .find(|entry| entry.registry_key == "opencode")
         .expect("opencode ACP registry entry exists");
     assert_eq!(opencode.command.command, "opencode");
-    assert_eq!(opencode.command.args, &["acp"]);
+    assert_eq!(opencode.command.args, &["acp", "--port", "0"]);
 
     let codex = KNOWN_ACP_AGENTS
         .iter()

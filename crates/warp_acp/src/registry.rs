@@ -15,9 +15,9 @@ pub fn opencode_registry_entry() -> KnownAcpAgent {
     KnownAcpAgent {
         registry_key: "opencode",
         name: "OpenCode",
-        command: AcpAgentCommand::new("opencode").args(["acp"]),
+        command: AcpAgentCommand::new("opencode").args(["acp", "--port", "0"]),
         install_url: Some("https://opencode.ai"),
-        notes: "Local `opencode acp` is the primary v1 smoke-test target.",
+        notes: "Local `opencode acp --port 0` avoids collisions with long-running OpenCode HTTP servers.",
     }
 }
 

@@ -6,7 +6,7 @@ Warp should let users configure local Agent Client Protocol (ACP) agents and run
 
 ## User Goals
 
-- Configure a named ACP agent in Warp Settings with an argv-style command, for example `opencode acp` or `codex-acp`.
+- Configure a named ACP agent in Warp Settings with an argv-style command, for example `opencode acp --port 0` or `codex-acp`.
 - Start that configured agent from the agent harness selector without hand-writing commands.
 - See streamed ACP output as Warp agent conversation content rather than raw terminal scrollback.
 - Review file writes, terminal commands, and permission requests through Warp's existing approval UX.
@@ -18,7 +18,7 @@ Warp should let users configure local Agent Client Protocol (ACP) agents and run
 - Users can configure local ACP agents with stable IDs, names, command, args, env metadata, install URL, registry key, local confirmation state, and MCP allowlist.
 - Commands are local-only and launched with `Command::new(command).args(args)`; Warp never interprets command strings through a shell.
 - Warp persists rendered block snapshots for history. Agent-side session load/resume is out of v1.
-- Initial curated registry seeds include OpenCode (`opencode acp`) and Codex via the Zed `codex-acp` wrapper.
+- Initial curated registry seeds include OpenCode (`opencode acp --port 0`) and Codex via the Zed `codex-acp` wrapper.
 
 ## Out of Scope
 
