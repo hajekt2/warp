@@ -6015,6 +6015,66 @@ impl SettingsWidget for CLIAgentWidget {
             }
         }
 
+        if FeatureFlag::AcpClient.is_enabled() {
+            column.add_child(
+                build_sub_header(
+                    appearance,
+                    "ACP agents",
+                    Some(styles::header_font_color(true, app)),
+                )
+                .with_padding_bottom(HEADER_PADDING)
+                .finish(),
+            );
+
+            let configured_agents = ai_settings.configured_acp_agents();
+            let summary = if configured_agents.is_empty() {
+                let seeds = AISettings::known_acp_agent_registry()
+                    .iter()
+                    .map(|entry| {
+                        let args = if entry.command.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", entry.command.args.join(" "))
+                        };
+                        format!("{} (`{}{}`)", entry.name, entry.command.command, args)
+                    })
+                    .join(", ");
+                format!(
+                    "No ACP agents are configured. Add local-only entries under `agents.third_party.acp_agents` in settings; seed commands include {seeds}."
+                )
+            } else {
+                configured_agents
+                    .iter()
+                    .map(|agent| {
+                        let args = if agent.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", agent.args.join(" "))
+                        };
+                        format!("{} (`{}{}`)", agent.name, agent.command, args)
+                    })
+                    .join("\n")
+            };
+
+            column.add_child(
+                appearance
+                    .ui_builder()
+                    .paragraph(summary)
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(styles::description_font_color(true, app).into()),
+                        margin: Some(
+                            Coords::default()
+                                .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                                .right(styles::TOGGLE_WIDTH_MARGIN),
+                        ),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+        }
+
         column.finish()
     }
 }
