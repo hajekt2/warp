@@ -1704,6 +1704,27 @@ define_settings_group!(AISettings, settings: [
     }
 ]);
 
+fn acp_agent_id_from_name(name: &str) -> AcpAgentId {
+    let mut id = String::new();
+    let mut last_was_dash = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !id.is_empty() {
+            id.push('-');
+            last_was_dash = true;
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id.is_empty() {
+        id.push_str("custom-acp");
+    }
+    AcpAgentId::new(id)
+}
+
 impl AISettings {
     /// Curated ACP registry entries that can seed user-configured agents.
     pub fn known_acp_agent_registry() -> &'static [AcpAgentRegistryEntry] {
@@ -1727,6 +1748,84 @@ impl AISettings {
         self.configured_acp_agents()
             .iter()
             .find(|config| &config.id == id)
+    }
+
+    pub fn add_acp_agent_from_registry_entry(
+        &mut self,
+        registry_key: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::AcpClient.is_enabled() {
+            return;
+        }
+        let Some(entry) = KNOWN_ACP_AGENTS
+            .iter()
+            .find(|entry| entry.registry_key == registry_key)
+        else {
+            return;
+        };
+
+        let mut configs = self.acp_agent_configs.value().clone();
+        let new_config = AcpAgentConfig::from_registry_entry(entry);
+        if configs.iter().any(|config| config.id == new_config.id) {
+            return;
+        }
+        configs.push(new_config);
+        report_if_error!(self.acp_agent_configs.set_value(configs, ctx));
+    }
+
+    pub fn add_custom_acp_agent_config(
+        &mut self,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::AcpClient.is_enabled() {
+            return;
+        }
+        let name = name.trim();
+        let command = command.trim();
+        if name.is_empty() || command.is_empty() {
+            return;
+        }
+
+        let mut configs = self.acp_agent_configs.value().clone();
+        let base_id = acp_agent_id_from_name(name);
+        let mut candidate = base_id.clone();
+        let mut suffix = 2;
+        while configs
+            .iter()
+            .any(|config| config.id.as_str() == candidate.as_str())
+        {
+            candidate = AcpAgentId::new(format!("{}-{suffix}", base_id.as_str()));
+            suffix += 1;
+        }
+
+        configs.push(AcpAgentConfig {
+            id: candidate,
+            name: name.to_string(),
+            command: command.to_string(),
+            args,
+            env: Vec::new(),
+            mcp_allowlist: Vec::new(),
+            install_url: None,
+            registry_key: None,
+            local_confirmation: AcpAgentLocalConfirmation {
+                confirmed_on_this_device: true,
+                confirmed_at: None,
+            },
+        });
+        report_if_error!(self.acp_agent_configs.set_value(configs, ctx));
+    }
+
+    pub fn remove_acp_agent_config(&mut self, id: &AcpAgentId, ctx: &mut ModelContext<Self>) {
+        if !FeatureFlag::AcpClient.is_enabled() {
+            return;
+        }
+        let mut configs = self.acp_agent_configs.value().clone();
+        configs.retain(|config| &config.id != id);
+        report_if_error!(self.acp_agent_configs.set_value(configs, ctx));
     }
 
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {

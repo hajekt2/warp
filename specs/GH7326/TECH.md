@@ -32,6 +32,10 @@ Warp initially advertises conservative capabilities. `fs`, `terminal`, and MCP f
 - `AgentHarnessSelection::{Builtin, Acp}` preserves existing built-in harness behavior while carrying `AcpAgentId` locally.
 - `crates/warp_acp` starts with local schema-shaped models; future work may replace these with `agent-client-protocol-schema` after resolving the repo's MCP dependency constraints.
 
+## Rollout
+
+ACP client support is compile-gated by `acp_client` and runtime-gated by `FeatureFlag::AcpClient`. Dogfood builds enable the runtime flag first; Preview/Stable promotion remains a follow-up after authenticated OpenCode/Codex prompt-turn validation.
+
 ## Verification
 
 - Unit tests for protocol serialization, argv validation, JSON-RPC framing, request/response correlation, notification handling, malformed JSON, timeout, cancellation, and abnormal child exit.

@@ -212,6 +212,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::schema::StopReason;
     use crate::transport::JsonRpcStdioTransport;
 
     #[derive(Clone, Default)]
@@ -283,6 +284,61 @@ mod tests {
         assert!(written.contains("session/cancel"));
         assert!(written.contains("s1"));
         assert!(!written.contains("\"id\""));
+    }
+
+    #[test]
+    fn prompt_denies_permission_request_before_response() {
+        let input = Cursor::new(
+            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"reason":"test"}}
+{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}
+"#
+            .to_vec(),
+        );
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
+            input, writer, None,
+        ));
+
+        let response = client
+            .prompt_with_conservative_request_handling(
+                SessionId::new("s1"),
+                vec![ContentBlock::text("hello")],
+            )
+            .unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains(r#""id":99"#));
+        assert!(written.contains("cancelled"));
+    }
+
+    #[test]
+    fn prompt_errors_disabled_filesystem_request_before_response() {
+        let input = Cursor::new(
+            br#"{"jsonrpc":"2.0","id":99,"method":"fs/write_text_file","params":{"path":"/tmp/x","content":"x"}}
+{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}
+"#
+            .to_vec(),
+        );
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
+            input, writer, None,
+        ));
+
+        let response = client
+            .prompt_with_conservative_request_handling(
+                SessionId::new("s1"),
+                vec![ContentBlock::text("hello")],
+            )
+            .unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains(r#""id":99"#));
+        assert!(written.contains(r#""code":-32001"#));
+        assert!(written.contains("not enabled"));
     }
 
     #[test]

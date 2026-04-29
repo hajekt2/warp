@@ -906,6 +906,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::CodeReviewScrollPreservation,
     FeatureFlag::OzIdentityFederation,
     FeatureFlag::AgentHarness,
+    FeatureFlag::AcpClient,
     FeatureFlag::OzHandoff,
     FeatureFlag::ConversationApi,
     FeatureFlag::RememberFastForwardState,

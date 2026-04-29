@@ -438,6 +438,66 @@ fn test_configured_acp_agents_are_feature_gated() {
 }
 
 #[test]
+fn test_add_and_remove_acp_agent_from_registry() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(settings.configured_acp_agents().len(), 1);
+            assert_eq!(
+                settings.configured_acp_agents()[0].id,
+                AcpAgentId::new("opencode")
+            );
+            assert_eq!(
+                settings.configured_acp_agents()[0].args,
+                &["acp", "--port", "0"]
+            );
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.remove_acp_agent_config(&AcpAgentId::new("opencode"), ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.configured_acp_agents().is_empty());
+        });
+    });
+}
+
+#[test]
+fn test_add_custom_acp_agent_config_generates_unique_local_ids() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_custom_acp_agent_config(
+                "My Local Agent",
+                "custom-acp",
+                vec!["--stdio".to_string()],
+                ctx,
+            );
+            settings.add_custom_acp_agent_config("My Local Agent", "custom-acp", Vec::new(), ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let configs = settings.configured_acp_agents();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(configs[0].id, AcpAgentId::new("my-local-agent"));
+            assert_eq!(configs[0].args, &["--stdio"]);
+            assert_eq!(configs[1].id, AcpAgentId::new("my-local-agent-2"));
+            assert!(configs[0].local_confirmation.confirmed_on_this_device);
+        });
+    });
+}
+
+#[test]
 fn test_toolbar_command_map_matched_agent() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);

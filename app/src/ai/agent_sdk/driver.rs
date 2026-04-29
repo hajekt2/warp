@@ -1490,6 +1490,7 @@ impl AgentDriver {
             }
         };
 
+        harness::validate_cli_installed(&config.command, config.install_url.as_deref())?;
         let command = config
             .to_launch_command()
             .map_err(AgentDriverError::ConfigBuildFailed)?;

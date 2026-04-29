@@ -21,6 +21,7 @@ use crate::cloud_object::JsonObjectType;
 use crate::cloud_object::ObjectType;
 
 use crate::editor::{EditorOptions, InteractionState, SingleLineEditorOptions, TextColors};
+use crate::settings::ai::AcpAgentId;
 use crate::settings::InputSettings;
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
@@ -37,6 +38,7 @@ use crate::settings::{
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
+use crate::util::path::resolve_executable;
 use crate::view_components::{
     action_button::{ActionButton, ButtonSize, SecondaryTheme},
     FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
@@ -415,6 +417,8 @@ pub struct AISettingsPageView {
     cli_agent_footer_command_agent_dropdowns: Vec<ViewHandle<Dropdown<AISettingsPageAction>>>,
     agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
     cli_agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
+    acp_agent_custom_editor: ViewHandle<SubmittableTextInput>,
+    acp_agent_action_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
 
     apply_code_diffs_dropdown_menu: ViewHandle<Dropdown<AISettingsPageAction>>,
     read_files_dropdown_menu: ViewHandle<Dropdown<AISettingsPageAction>>,
@@ -1353,6 +1357,23 @@ impl AISettingsPageView {
             AgentToolbarInlineEditor::new(AgentToolbarEditorMode::CLIAgent, ctx)
         });
 
+        let acp_agent_custom_editor = ctx.add_typed_action_view(|ctx| {
+            let mut input = SubmittableTextInput::new(ctx)
+                .validate_on_submit(|s| parse_acp_agent_input(s).is_some());
+            input.set_placeholder_text("Name | command arg1 arg2", ctx);
+            input
+        });
+        ctx.subscribe_to_view(&acp_agent_custom_editor, |_, _, event, ctx| {
+            if let SubmittableTextInputEvent::Submit(input) = event {
+                if let Some((name, command, args)) = parse_acp_agent_input(input) {
+                    AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                        settings.add_custom_acp_agent_config(&name, &command, args, ctx);
+                    });
+                    ctx.notify();
+                }
+            }
+        });
+
         #[cfg(feature = "local_fs")]
         let conversation_layout_dropdown = ctx.add_typed_action_view(|ctx| {
             use crate::util::file::external_editor::settings::OpenConversationPreference;
@@ -1401,6 +1422,8 @@ impl AISettingsPageView {
             cli_agent_footer_command_agent_dropdowns: Self::create_cli_agent_dropdowns(ctx),
             agent_toolbar_inline_editor,
             cli_agent_toolbar_inline_editor,
+            acp_agent_custom_editor,
+            acp_agent_action_mouse_states: Default::default(),
             base_model_dropdown,
             coding_model_dropdown,
             context_window_slider_state,
@@ -2219,6 +2242,8 @@ pub enum AISettingsPageAction {
     SetThinkingDisplayMode(ThinkingDisplayMode),
     AttemptLoginGatedUpgrade,
     RemoveCLIAgentToolbarEnabledCommand(String),
+    AddAcpAgentFromRegistry(String),
+    RemoveAcpAgent(AcpAgentId),
     RemoveFromCommandExecutionAllowlist(AgentModeCommandExecutionPredicate),
     RemoveFromCommandExecutionDenylist(AgentModeCommandExecutionPredicate),
     OpenAIFactCollection,
@@ -2671,6 +2696,18 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.remove_cli_agent_footer_enabled_command(command, ctx);
                 });
+            }
+            AISettingsPageAction::AddAcpAgentFromRegistry(registry_key) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.add_acp_agent_from_registry_entry(registry_key, ctx);
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::RemoveAcpAgent(id) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.remove_acp_agent_config(id, ctx);
+                });
+                ctx.notify();
             }
             AISettingsPageAction::SetCLIAgentForCommand { pattern, agent } => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -6026,57 +6063,245 @@ impl SettingsWidget for CLIAgentWidget {
                 .finish(),
             );
 
-            let configured_agents = ai_settings.configured_acp_agents();
-            let summary = if configured_agents.is_empty() {
-                let seeds = AISettings::known_acp_agent_registry()
-                    .iter()
-                    .map(|entry| {
-                        let args = if entry.command.args.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {}", entry.command.args.join(" "))
-                        };
-                        format!("{} (`{}{}`)", entry.name, entry.command.command, args)
-                    })
-                    .join(", ");
-                format!(
-                    "No ACP agents are configured. Add local-only entries under `agents.third_party.acp_agents` in settings; seed commands include {seeds}."
-                )
-            } else {
-                configured_agents
-                    .iter()
-                    .map(|agent| {
-                        let args = if agent.args.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {}", agent.args.join(" "))
-                        };
-                        format!("{} (`{}{}`)", agent.name, agent.command, args)
-                    })
-                    .join("\n")
-            };
-
-            column.add_child(
-                appearance
-                    .ui_builder()
-                    .paragraph(summary)
-                    .with_style(UiComponentStyles {
-                        font_size: Some(appearance.ui_font_size()),
-                        font_color: Some(styles::description_font_color(true, app).into()),
-                        margin: Some(
-                            Coords::default()
-                                .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
-                                .right(styles::TOGGLE_WIDTH_MARGIN),
-                        ),
-                        ..Default::default()
-                    })
-                    .build()
-                    .finish(),
-            );
+            column.add_child(render_acp_agents_settings(view, appearance, app));
         }
 
         column.finish()
     }
+}
+
+fn parse_acp_agent_input(input: &str) -> Option<(String, String, Vec<String>)> {
+    let (name, argv) = input.split_once('|')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let argv = shell_words::split(argv.trim()).ok()?;
+    let (command, args) = argv.split_first()?;
+    Some((name.to_string(), command.clone(), args.to_vec()))
+}
+
+fn acp_action_mouse_state(view: &AISettingsPageView, key: impl Into<String>) -> MouseStateHandle {
+    let key = key.into();
+    view.acp_agent_action_mouse_states
+        .borrow_mut()
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+fn render_acp_agents_settings(
+    view: &AISettingsPageView,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let ai_settings = AISettings::as_ref(app);
+    let configured_agents = ai_settings.configured_acp_agents();
+    let font_color = appearance.theme().foreground().into_solid();
+    let description_color = styles::description_font_color(true, app).into();
+    let background = appearance.theme().surface_1();
+
+    let mut column = Flex::column();
+
+    column.add_child(
+        appearance
+            .ui_builder()
+            .paragraph(
+                "Run local ACP-compatible agents inside Warp's agent UI. Commands are local-only, launched without a shell, and must be configured on each device."
+            )
+            .with_style(UiComponentStyles {
+                font_size: Some(appearance.ui_font_size()),
+                font_color: Some(description_color),
+                margin: Some(
+                    Coords::default()
+                        .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                        .right(styles::TOGGLE_WIDTH_MARGIN),
+                ),
+                ..Default::default()
+            })
+            .build()
+            .finish(),
+    );
+
+    column.add_child(ChildView::new(&view.acp_agent_custom_editor).finish());
+    column.add_child(
+        appearance
+            .ui_builder()
+            .paragraph(
+                "Add a custom local agent with `Name | command arg1 arg2`. Warp parses this into argv and still launches without shell expansion."
+            )
+            .with_style(UiComponentStyles {
+                font_size: Some(appearance.ui_font_size()),
+                font_color: Some(description_color),
+                margin: Some(
+                    Coords::default()
+                        .top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
+                        .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                        .right(styles::TOGGLE_WIDTH_MARGIN),
+                ),
+                ..Default::default()
+            })
+            .build()
+            .finish(),
+    );
+
+    for agent in configured_agents {
+        let args = if agent.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", agent.args.join(" "))
+        };
+        let command = format!("{}{}", agent.command, args);
+        let status = if resolve_executable(&agent.command).is_some() {
+            "Command found on PATH.".to_string()
+        } else if let Some(url) = &agent.install_url {
+            format!("Command not found on PATH. Install or configure it: {url}")
+        } else {
+            "Command not found on PATH.".to_string()
+        };
+        let remove_action = AISettingsPageAction::RemoveAcpAgent(agent.id.clone());
+        let remove_button = appearance
+            .ui_builder()
+            .button(
+                ButtonVariant::Text,
+                acp_action_mouse_state(view, format!("remove:{}", agent.id)),
+            )
+            .with_centered_text_label("Remove".to_string())
+            .build()
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(remove_action.clone()))
+            .finish();
+
+        let labels = Flex::column()
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .wrappable_text(agent.name.clone(), true)
+                    .with_style(UiComponentStyles {
+                        font_color: Some(font_color),
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .wrappable_text(command, true)
+                    .with_style(UiComponentStyles {
+                        font_color: Some(description_color),
+                        font_family_id: Some(appearance.monospace_font_family()),
+                        font_size: Some(appearance.ui_font_size()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .wrappable_text(status, true)
+                    .with_style(UiComponentStyles {
+                        font_color: Some(description_color),
+                        font_size: Some(appearance.ui_font_size()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .finish();
+
+        column.add_child(
+            Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_children([Shrinkable::new(1., labels).finish(), remove_button])
+                    .finish(),
+            )
+            .with_background(background)
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_margin_bottom(6.)
+            .finish(),
+        );
+    }
+
+    let configured_ids: std::collections::HashSet<_> = configured_agents
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect();
+    let mut seed_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+    let mut added_seed_button = false;
+    for entry in AISettings::known_acp_agent_registry() {
+        if configured_ids.contains(entry.registry_key) {
+            continue;
+        }
+        added_seed_button = true;
+        let registry_key = entry.registry_key.to_string();
+        let action = AISettingsPageAction::AddAcpAgentFromRegistry(registry_key.clone());
+        let args = if entry.command.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", entry.command.args.join(" "))
+        };
+        let button = appearance
+            .ui_builder()
+            .button(
+                ButtonVariant::Secondary,
+                acp_action_mouse_state(view, format!("add:{registry_key}")),
+            )
+            .with_centered_text_label(format!("Add {}", entry.name))
+            .build()
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish();
+        seed_row.add_child(Container::new(button).with_margin_right(8.).finish());
+        seed_row.add_child(
+            Container::new(
+                appearance
+                    .ui_builder()
+                    .wrappable_text(format!("`{}{}`", entry.command.command, args), true)
+                    .with_style(UiComponentStyles {
+                        font_color: Some(description_color),
+                        font_family_id: Some(appearance.monospace_font_family()),
+                        font_size: Some(appearance.ui_font_size()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_margin_right(16.)
+            .finish(),
+        );
+    }
+
+    if added_seed_button {
+        column.add_child(
+            Container::new(seed_row.finish())
+                .with_margin_top(4.)
+                .with_margin_bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                .finish(),
+        );
+    } else if configured_agents.is_empty() {
+        column.add_child(
+            appearance
+                .ui_builder()
+                .paragraph("No curated ACP agents are available for this build.".to_string())
+                .with_style(UiComponentStyles {
+                    font_size: Some(appearance.ui_font_size()),
+                    font_color: Some(description_color),
+                    margin: Some(Coords::default().bottom(styles::DESCRIPTION_MARGIN_BOTTOM)),
+                    ..Default::default()
+                })
+                .build()
+                .finish(),
+        );
+    }
+
+    column.finish()
 }
 
 /// The presentation state of the agent attribution toggle, derived from the

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,6 +52,7 @@ pub struct JsonRpcStdioTransport {
     pending: Arc<Mutex<HashMap<u64, PendingSender>>>,
     inbound_rx: Mutex<mpsc::Receiver<AgentMessage>>,
     next_request_id: AtomicU64,
+    closed: Arc<AtomicBool>,
     child: Mutex<Option<Child>>,
 }
 
@@ -83,6 +84,8 @@ impl JsonRpcStdioTransport {
         let pending: Arc<Mutex<HashMap<u64, PendingSender>>> = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel();
         let pending_for_thread = Arc::clone(&pending);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_for_thread = Arc::clone(&closed);
 
         thread::spawn(move || {
             let reader = BufReader::new(reader);
@@ -112,6 +115,13 @@ impl JsonRpcStdioTransport {
                     }
                 }
             }
+            // EOF means the subprocess exited or closed stdout. Drop all pending
+            // response senders so blocked requests return `Closed` immediately
+            // instead of waiting for their full timeout.
+            closed_for_thread.store(true, Ordering::Relaxed);
+            if let Ok(mut pending) = pending_for_thread.lock() {
+                pending.clear();
+            }
         });
 
         Self {
@@ -119,6 +129,7 @@ impl JsonRpcStdioTransport {
             pending,
             inbound_rx: Mutex::new(inbound_rx),
             next_request_id: AtomicU64::new(1),
+            closed,
             child: Mutex::new(child),
         }
     }
@@ -156,6 +167,10 @@ impl JsonRpcStdioTransport {
         R: DeserializeOwned,
         F: FnMut(AgentMessage, &Self) -> Result<(), JsonRpcTransportError>,
     {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(JsonRpcTransportError::Closed);
+        }
+
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending
@@ -172,6 +187,10 @@ impl JsonRpcStdioTransport {
         let started_at = Instant::now();
         loop {
             self.drain_agent_messages(&mut handle_agent_message)?;
+            if self.closed.load(Ordering::Relaxed) {
+                self.pending.lock().expect("pending poisoned").remove(&id);
+                return Err(JsonRpcTransportError::Closed);
+            }
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 self.pending.lock().expect("pending poisoned").remove(&id);
@@ -278,7 +297,7 @@ impl JsonRpcStdioTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;
@@ -344,13 +363,19 @@ mod tests {
         );
     }
 
+    struct SlowEofReader;
+
+    impl Read for SlowEofReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(0)
+        }
+    }
+
     #[test]
     fn request_times_out_and_clears_pending_entry() {
-        let transport = JsonRpcStdioTransport::from_reader_writer(
-            Cursor::new(Vec::new()),
-            SharedWriter::default(),
-            None,
-        );
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(SlowEofReader, SharedWriter::default(), None);
 
         let error = transport
             .request_timeout::<_, Value>("initialize", json!({}), Duration::from_millis(5))
@@ -358,5 +383,41 @@ mod tests {
 
         assert!(matches!(error, JsonRpcTransportError::Timeout { .. }));
         assert!(transport.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_returns_closed_when_reader_ends_before_response() {
+        let transport = JsonRpcStdioTransport::from_reader_writer(
+            Cursor::new(Vec::new()),
+            SharedWriter::default(),
+            None,
+        );
+
+        let error = transport
+            .request_timeout::<_, Value>("initialize", json!({}), Duration::from_secs(1))
+            .unwrap_err();
+
+        assert!(matches!(error, JsonRpcTransportError::Closed));
+        assert!(transport.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_json_surfaces_diagnostic_notification() {
+        let input = Cursor::new(b"{not json}\n".to_vec());
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(input, SharedWriter::default(), None);
+
+        let message = transport
+            .recv_message(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        match message {
+            AgentMessage::Notification { method, params } => {
+                assert_eq!(method, "$/warp/malformedFrame");
+                assert!(params.as_str().unwrap_or_default().contains("key"));
+            }
+            other => panic!("expected malformed-frame notification, got {other:?}"),
+        }
     }
 }
