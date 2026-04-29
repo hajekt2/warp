@@ -100,11 +100,31 @@ impl AcpClient {
         session_id: SessionId,
         prompt: Vec<ContentBlock>,
     ) -> Result<PromptResponse, AcpClientError> {
+        self.prompt_with_agent_message_handler(session_id, prompt, |_| {})
+    }
+
+    /// Send a prompt and surface agent notifications while denying unsupported
+    /// agent-to-client requests.
+    pub fn prompt_with_agent_message_handler<F>(
+        &self,
+        session_id: SessionId,
+        prompt: Vec<ContentBlock>,
+        mut handle_message: F,
+    ) -> Result<PromptResponse, AcpClientError>
+    where
+        F: FnMut(AgentMessage),
+    {
         Ok(self.transport.request_timeout_with_handler(
             SESSION_PROMPT_METHOD,
             PromptRequest { session_id, prompt },
             Duration::from_secs(30),
-            deny_unsupported_agent_request,
+            |message, transport| match message {
+                AgentMessage::Notification { .. } => {
+                    handle_message(message);
+                    Ok(())
+                }
+                AgentMessage::Request { .. } => deny_unsupported_agent_request(message, transport),
+            },
         )?)
     }
 
