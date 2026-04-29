@@ -68,6 +68,7 @@ vim = { path = "crates/vim" }
 virtual-fs = { path = "crates/virtual_fs" }
 voice_input = { path = "crates/voice_input" }
 warp = { path = "app" }
+warp_acp = { path = "crates/warp_acp" }
 warp_cli = { path = "crates/warp_cli" }
 warp_completer = { path = "crates/warp_completer" }
 warp_core = { path = "crates/warp_core" }
