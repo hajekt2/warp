@@ -699,6 +699,9 @@ pub enum FeatureFlag {
     /// Ctrl-G intercepts the keystroke and opens Warp's input editor instead of $EDITOR.
     CLIAgentRichInput,
 
+    /// Enables Agent Client Protocol (ACP) client support for configured local agents.
+    AcpClient,
+
     /// Enables incremental (diff-based) buffer updates for auto-reload instead of full replace.
     IncrementalAutoReload,
 

@@ -422,6 +422,7 @@ embed-resource = "3.0"
 # Note that we support channel-specific enables for these features
 [features]
 ai_resume_button = []
+acp_client = []
 autoupdate = []
 figma_detection = []
 bundled_skills = []
