@@ -298,6 +298,8 @@ impl AmbientAgentViewModel {
                 self.harness_selection,
                 AgentHarnessSelection::Builtin(harness) if harness != Harness::Oz
             )
+            || (FeatureFlag::AcpClient.is_enabled()
+                && matches!(self.harness_selection, AgentHarnessSelection::Acp(_)))
     }
 
     /// Whether the harness CLI has started running. Only meaningful for non-oz runs.
@@ -530,9 +532,12 @@ impl AmbientAgentViewModel {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let harness_override = match self.harness_selection.builtin_harness() {
-            Some(Harness::Oz) | None => None,
-            Some(harness) => Some(HarnessConfig::from_harness_type(harness)),
+        let harness_override = match &self.harness_selection {
+            AgentHarnessSelection::Builtin(Harness::Oz) => None,
+            AgentHarnessSelection::Builtin(harness) => {
+                Some(HarnessConfig::from_harness_type(*harness))
+            }
+            AgentHarnessSelection::Acp(id) => Some(HarnessConfig::from_acp_agent_id(id.clone())),
         };
 
         let config = Some(AgentConfigSnapshot {

@@ -4,7 +4,7 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -141,6 +141,21 @@ impl JsonRpcStdioTransport {
         P: Serialize,
         R: DeserializeOwned,
     {
+        self.request_timeout_with_handler(method, params, timeout, |_, _| Ok(()))
+    }
+
+    pub fn request_timeout_with_handler<P, R, F>(
+        &self,
+        method: &str,
+        params: P,
+        timeout: Duration,
+        mut handle_agent_message: F,
+    ) -> Result<R, JsonRpcTransportError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+        F: FnMut(AgentMessage, &Self) -> Result<(), JsonRpcTransportError>,
+    {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending
@@ -154,21 +169,36 @@ impl JsonRpcStdioTransport {
             return Err(error);
         }
 
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(value)) => serde_json::from_value(value).map_err(JsonRpcTransportError::Decode),
-            Ok(Err(error)) => Err(JsonRpcTransportError::RemoteError {
-                code: error.code,
-                message: error.message,
-                data: error.data,
-            }),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        let started_at = Instant::now();
+        loop {
+            self.drain_agent_messages(&mut handle_agent_message)?;
+            let elapsed = started_at.elapsed();
+            if elapsed >= timeout {
                 self.pending.lock().expect("pending poisoned").remove(&id);
-                Err(JsonRpcTransportError::Timeout {
+                return Err(JsonRpcTransportError::Timeout {
                     method: method.to_string(),
                     timeout,
-                })
+                });
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(JsonRpcTransportError::Closed),
+            let wait = (timeout - elapsed).min(Duration::from_millis(50));
+            match rx.recv_timeout(wait) {
+                Ok(Ok(value)) => {
+                    self.drain_agent_messages(&mut handle_agent_message)?;
+                    return serde_json::from_value(value).map_err(JsonRpcTransportError::Decode);
+                }
+                Ok(Err(error)) => {
+                    self.drain_agent_messages(&mut handle_agent_message)?;
+                    return Err(JsonRpcTransportError::RemoteError {
+                        code: error.code,
+                        message: error.message,
+                        data: error.data,
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(JsonRpcTransportError::Closed)
+                }
+            }
         }
     }
 
@@ -217,6 +247,23 @@ impl JsonRpcStdioTransport {
             child.kill()?;
         }
         Ok(())
+    }
+
+    fn drain_agent_messages<F>(&self, handler: &mut F) -> Result<(), JsonRpcTransportError>
+    where
+        F: FnMut(AgentMessage, &Self) -> Result<(), JsonRpcTransportError>,
+    {
+        loop {
+            let message = {
+                let rx = self.inbound_rx.lock().expect("inbound poisoned");
+                rx.try_recv()
+            };
+            match message {
+                Ok(message) => handler(message, self)?,
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
     }
 
     fn write_frame<T: Serialize>(&self, frame: &T) -> Result<(), JsonRpcTransportError> {

@@ -68,7 +68,7 @@ use crate::ai::skills::{
 };
 
 pub(crate) use driver::harness::{
-    task_env_vars, validate_cli_installed, ClaudeHarness, ThirdPartyHarness,
+    task_env_vars, validate_cli_installed, AcpHarness, ClaudeHarness, ThirdPartyHarness,
 };
 pub use driver::AgentDriver;
 use telemetry::CliTelemetryEvent;
@@ -349,9 +349,8 @@ fn build_merged_config_and_task(
         None => (None, None),
     };
 
-    let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
-        harness_type: args.harness,
-    });
+    let harness_override =
+        (args.harness != Harness::Oz).then_some(HarnessConfig::from_harness_type(args.harness));
 
     let mut merged_config = AgentConfigSnapshot {
         // CLI name > skill name > file name
@@ -433,9 +432,8 @@ fn build_server_side_task(
         .map(|model_id| common::validate_agent_mode_base_model_id(model_id, ctx))
         .transpose()?;
 
-    let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
-        harness_type: args.harness,
-    });
+    let harness_override =
+        (args.harness != Harness::Oz).then_some(HarnessConfig::from_harness_type(args.harness));
 
     let skill_name = resolved_skill.as_ref().map(|s| s.name.clone());
     let model_id_string = model_override.as_ref().map(|id| id.to_string());
@@ -1037,27 +1035,30 @@ impl AgentDriverRunner {
                 }
             }
         };
-        let (parent_run_id, task_conversation_id, task_harness) = match task_metadata_result {
-            Ok(Some(task_metadata)) => {
-                // The task's harness is stored on the snapshot; if absent, it's the default Oz.
-                let task_harness = task_metadata
-                    .agent_config_snapshot
-                    .as_ref()
-                    .and_then(|c| c.harness.as_ref())
-                    .map(|h| h.harness_type)
-                    .unwrap_or(Harness::Oz);
-                (
-                    task_metadata.parent_run_id,
-                    task_metadata.conversation_id,
-                    Some(task_harness),
-                )
-            }
-            Ok(None) => (None, None, None),
-            Err(err) => {
-                log::warn!("Failed to fetch task metadata: {err:#}");
-                (None, None, None)
-            }
-        };
+        let (parent_run_id, task_conversation_id, task_harness, task_acp_agent_id) =
+            match task_metadata_result {
+                Ok(Some(task_metadata)) => {
+                    // The task's harness is stored on the snapshot; if absent, it's the default Oz.
+                    let harness_config = task_metadata
+                        .agent_config_snapshot
+                        .as_ref()
+                        .and_then(|c| c.harness.as_ref());
+                    let task_harness = harness_config
+                        .map(|h| h.harness_type)
+                        .unwrap_or(Harness::Oz);
+                    (
+                        task_metadata.parent_run_id,
+                        task_metadata.conversation_id,
+                        Some(task_harness),
+                        harness_config.and_then(|h| h.acp_agent_id.clone()),
+                    )
+                }
+                Ok(None) => (None, None, None, None),
+                Err(err) => {
+                    log::warn!("Failed to fetch task metadata: {err:#}");
+                    (None, None, None, None)
+                }
+            };
 
         // Validate the requested `--harness` against the task's harness setting. This avoids the
         // extra conversation-metadata roundtrip that would otherwise be needed downstream when the
@@ -1070,6 +1071,11 @@ impl AgentDriverRunner {
                     expected: task_harness.to_string(),
                     got: driver_options.selected_harness.to_string(),
                 });
+            }
+        }
+        if let Some(agent_id) = task_acp_agent_id {
+            if matches!(task.harness, HarnessKind::Acp(_)) {
+                task.harness = HarnessKind::Acp(AcpHarness::with_agent_id(agent_id));
             }
         }
 

@@ -1434,20 +1434,30 @@ impl AgentDriver {
     /// This is intentionally separate from the terminal-backed `HarnessRunner` path:
     /// ACP agents are subprocess protocols, not TUIs whose scrollback should be scraped.
     async fn run_acp_harness(
-        _harness: AcpHarness,
+        harness: AcpHarness,
         prompt: AgentRunPrompt,
         foreground: &ModelSpawner<Self>,
     ) -> Result<(), AgentDriverError> {
+        let selected_agent_id = harness.agent_id().cloned();
         let (working_dir, config, server_api) = foreground
-            .spawn(|me, ctx| {
-                let config = AISettings::as_ref(ctx)
-                    .configured_acp_agents()
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| AgentDriverError::HarnessSetupFailed {
-                        harness: Harness::Acp.to_string(),
-                        reason: "No ACP agents are configured in AI settings.".to_string(),
-                    })?;
+            .spawn(move |me, ctx| {
+                let settings = AISettings::as_ref(ctx);
+                let config = match selected_agent_id.as_ref() {
+                    Some(id) => settings.acp_agent_config(id).cloned().ok_or_else(|| {
+                        AgentDriverError::HarnessSetupFailed {
+                            harness: Harness::Acp.to_string(),
+                            reason: format!("Configured ACP agent '{id}' was not found."),
+                        }
+                    })?,
+                    None => settings
+                        .configured_acp_agents()
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| AgentDriverError::HarnessSetupFailed {
+                            harness: Harness::Acp.to_string(),
+                            reason: "No ACP agents are configured in AI settings.".to_string(),
+                        })?,
+                };
                 Ok::<_, AgentDriverError>((
                     me.working_dir.clone(),
                     config,
@@ -1489,7 +1499,10 @@ impl AgentDriver {
                 .new_session(NewSessionRequest::new(working_dir))
                 .map_err(anyhow::Error::from)?;
             client
-                .prompt(session.session_id, vec![ContentBlock::text(prompt)])
+                .prompt_with_conservative_request_handling(
+                    session.session_id,
+                    vec![ContentBlock::text(prompt)],
+                )
                 .map_err(anyhow::Error::from)?;
             Ok::<_, anyhow::Error>(())
         })

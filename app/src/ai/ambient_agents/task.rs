@@ -10,6 +10,7 @@ use warpui::color::ColorU;
 
 use crate::ai::artifacts::{deserialize_artifacts, Artifact};
 use crate::server::server_api::ServerApiProvider;
+use crate::settings::ai::AcpAgentId;
 use crate::ui_components::icons::Icon;
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
@@ -74,12 +75,26 @@ pub struct HarnessConfig {
         deserialize_with = "deserialize_harness"
     )]
     pub harness_type: Harness,
+    /// Stable settings ID for dynamic ACP agents. Kept out of [`Harness`] so the shared
+    /// harness enum remains fieldless and suitable for CLI/server slugs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<AcpAgentId>,
 }
 
 impl HarnessConfig {
     /// Builds a harness config from just the harness type.
     pub fn from_harness_type(harness_type: Harness) -> Self {
-        Self { harness_type }
+        Self {
+            harness_type,
+            acp_agent_id: None,
+        }
+    }
+
+    pub fn from_acp_agent_id(acp_agent_id: AcpAgentId) -> Self {
+        Self {
+            harness_type: Harness::Acp,
+            acp_agent_id: Some(acp_agent_id),
+        }
     }
 }
 

@@ -22,8 +22,9 @@ use warp_core::ui::theme::Fill;
 use crate::ai::blocklist::agent_view::agent_input_footer::AgentInputButtonTheme;
 use crate::ai::harness_display::{display_name, icon_for};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::settings::ai::{AISettings, AcpAgentConfig, AcpAgentId};
 use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
-use crate::terminal::view::ambient_agent::AmbientAgentViewModel;
+use crate::terminal::view::ambient_agent::{AgentHarnessSelection, AmbientAgentViewModel};
 use crate::view_components::action_button::{ActionButton, ActionButtonTheme, ButtonSize};
 
 /// Font size for the header row (Figma: 12px).
@@ -61,8 +62,10 @@ const MENU_HEADER_LABEL: &str = "Agent harness";
 pub enum HarnessSelectorAction {
     /// Toggle the visibility of the dropdown menu.
     ToggleMenu,
-    /// The user picked a harness from the dropdown.
+    /// The user picked a built-in harness from the dropdown.
     SelectHarness(Harness),
+    /// The user picked a configured ACP agent from the dropdown.
+    SelectAcpAgent(AcpAgentId),
 }
 
 /// Events emitted by the [`HarnessSelector`].
@@ -159,9 +162,22 @@ impl HarnessSelector {
     }
 
     fn refresh_button(&mut self, ctx: &mut ViewContext<Self>) {
-        let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
-        let label = display_name(harness).to_string();
-        let icon = icon_for(harness);
+        let (label, icon) = match self
+            .ambient_agent_model
+            .as_ref(ctx)
+            .selected_harness_selection()
+        {
+            AgentHarnessSelection::Builtin(harness) => {
+                (display_name(*harness).to_string(), icon_for(*harness))
+            }
+            AgentHarnessSelection::Acp(id) => {
+                let label = AISettings::as_ref(ctx)
+                    .acp_agent_config(id)
+                    .map(|config| config.name.clone())
+                    .unwrap_or_else(|| "ACP".to_string());
+                (label, icon_for(Harness::Acp))
+            }
+        };
         self.button.update(ctx, |button, ctx| {
             button.set_label(label, ctx);
             button.set_icon(Some(icon), ctx);
@@ -174,7 +190,8 @@ impl HarnessSelector {
         let hover_background: Fill = internal_colors::neutral_4(theme).into();
         let header_text_color = theme.disabled_text_color(theme.surface_2()).into_solid();
         let border = Border::all(1.).with_border_fill(theme.outline());
-        let items = build_menu_items(hover_background, header_text_color);
+        let configured_acp_agents = AISettings::as_ref(ctx).configured_acp_agents().to_vec();
+        let items = build_menu_items(hover_background, header_text_color, &configured_acp_agents);
         self.menu.update(ctx, |menu, ctx| {
             menu.set_border(Some(border));
             menu.set_items(items, ctx);
@@ -206,6 +223,7 @@ impl HarnessSelector {
 fn build_menu_items(
     hover_background: Fill,
     header_text_color: pathfinder_color::ColorU,
+    configured_acp_agents: &[AcpAgentConfig],
 ) -> Vec<MenuItem<HarnessSelectorAction>> {
     let header = MenuItem::Header {
         fields: MenuItemFields::new(MENU_HEADER_LABEL)
@@ -229,12 +247,26 @@ fn build_menu_items(
         )
     };
 
-    vec![
+    let acp_item_for = |config: &AcpAgentConfig| {
+        MenuItem::Item(
+            MenuItemFields::new(&config.name)
+                .with_icon(icon_for(Harness::Acp))
+                .with_icon_size_override(ITEM_ICON_SIZE)
+                .with_font_size_override(ITEM_FONT_SIZE)
+                .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
+                .with_override_hover_background_color(hover_background)
+                .with_on_select_action(HarnessSelectorAction::SelectAcpAgent(config.id.clone())),
+        )
+    };
+
+    let mut items = vec![
         header,
         item_for(Harness::Oz),
         item_for(Harness::Claude),
         item_for(Harness::Gemini),
-    ]
+    ];
+    items.extend(configured_acp_agents.iter().map(acp_item_for));
+    items
 }
 
 impl Entity for HarnessSelector {
@@ -254,6 +286,13 @@ impl TypedActionView for HarnessSelector {
                 let harness = *harness;
                 self.ambient_agent_model.update(ctx, |model, ctx| {
                     model.set_harness(harness, ctx);
+                });
+                self.set_menu_visibility(false, ctx);
+            }
+            HarnessSelectorAction::SelectAcpAgent(id) => {
+                let id = id.clone();
+                self.ambient_agent_model.update(ctx, |model, ctx| {
+                    model.set_harness_selection(AgentHarnessSelection::Acp(id), ctx);
                 });
                 self.set_menu_visibility(false, ctx);
             }

@@ -9,7 +9,7 @@ use crate::schema::{
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
 };
 use crate::transport::{JsonRpcStdioTransport, JsonRpcTransportError};
-use crate::AgentMessage;
+use crate::{AgentMessage, JsonRpcErrorObject};
 
 const INITIALIZE_METHOD: &str = "initialize";
 const SESSION_NEW_METHOD: &str = "session/new";
@@ -90,6 +90,24 @@ impl AcpClient {
             .request(SESSION_PROMPT_METHOD, PromptRequest { session_id, prompt })?)
     }
 
+    /// Send a prompt while conservatively denying agent-initiated client requests.
+    ///
+    /// Warp advertises no filesystem or terminal capability until those requests are
+    /// routed through native approval UI. If an agent still calls them, respond rather
+    /// than leaving the protocol turn hanging.
+    pub fn prompt_with_conservative_request_handling(
+        &self,
+        session_id: SessionId,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<PromptResponse, AcpClientError> {
+        Ok(self.transport.request_timeout_with_handler(
+            SESSION_PROMPT_METHOD,
+            PromptRequest { session_id, prompt },
+            Duration::from_secs(30),
+            deny_unsupported_agent_request,
+        )?)
+    }
+
     pub fn cancel(&self, session_id: SessionId) -> Result<(), AcpClientError> {
         self.transport.notify(
             SESSION_CANCEL_METHOD,
@@ -122,6 +140,47 @@ impl AcpClient {
         Ok(self
             .transport
             .respond_error(id, crate::JsonRpcErrorObject::new(code, message))?)
+    }
+}
+
+fn deny_unsupported_agent_request(
+    message: AgentMessage,
+    transport: &JsonRpcStdioTransport,
+) -> Result<(), JsonRpcTransportError> {
+    let AgentMessage::Request { id, method, .. } = message else {
+        return Ok(());
+    };
+
+    match method.as_str() {
+        // We have not surfaced Warp's permission UI yet. A cancellation-shaped
+        // response is safer than implicitly granting or hanging the agent.
+        "session/request_permission" => transport.respond_result(
+            id,
+            serde_json::json!({
+                "outcome": {
+                    "outcome": "cancelled"
+                }
+            }),
+        ),
+        // These methods are disabled in conservative ClientCapabilities. Agents
+        // should not call them; if they do, return a JSON-RPC error immediately.
+        "fs/read_text_file"
+        | "fs/write_text_file"
+        | "terminal/create"
+        | "terminal/output"
+        | "terminal/release"
+        | "terminal/wait_for_exit"
+        | "terminal/kill" => transport.respond_error(
+            id,
+            JsonRpcErrorObject::new(
+                -32001,
+                format!("ACP client method `{method}` is not enabled"),
+            ),
+        ),
+        _ => transport.respond_error(
+            id,
+            JsonRpcErrorObject::new(-32601, format!("Unknown ACP client method `{method}`")),
+        ),
     }
 }
 
