@@ -619,6 +619,14 @@ impl AmbientAgentViewModel {
                     agent_id.as_str(),
                     stream_handle.conversation_id
                 );
+                let ready_conversation_id = stream_handle.conversation_id;
+                foreground
+                    .spawn(move |_, ctx| {
+                        ctx.emit(AmbientAgentViewModelEvent::LocalAcpConversationReady {
+                            conversation_id: ready_conversation_id,
+                        });
+                    })
+                    .await?;
 
                 let (output_tx, mut output_rx) =
                     tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
@@ -792,11 +800,9 @@ impl AmbientAgentViewModel {
             },
             |me, result, ctx| {
                 match result {
-                    Ok(conversation_id) => {
+                    Ok(_conversation_id) => {
                         me.status = Status::Composing;
-                        ctx.emit(AmbientAgentViewModelEvent::LocalAcpConversationReady {
-                            conversation_id,
-                        });
+                        ctx.emit(AmbientAgentViewModelEvent::EnteredComposingState);
                     }
                     Err(error) => {
                         me.handle_spawn_error(format!("ACP agent failed: {error:#}"), ctx);

@@ -692,10 +692,24 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
                 else {
                     return false;
                 };
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && view.agent_view_controller().as_ref(ctx).is_active()
+            }),
+            "configured ACP login fixture should open the local agent conversation immediately while the prompt is still running"
+        );
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
+                    .active_conversation(view.view_id)
+                else {
+                    return false;
+                };
                 let Some(exchange) = conversation.latest_exchange() else {
                     return false;
                 };
                 view.active_conversation_id(ctx) == Some(conversation.id())
+                    && view.agent_view_controller().as_ref(ctx).is_active()
                     && exchange.output_status.is_finished_and_successful()
                     && exchange.format_output_for_copy(None).contains("echo: test")
             }),

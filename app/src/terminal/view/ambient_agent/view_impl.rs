@@ -300,6 +300,10 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::LocalAcpConversationReady { conversation_id } => {
+                log::info!(
+                    "Opening local ACP conversation {} in agent view",
+                    conversation_id
+                );
                 self.enter_agent_view_for_conversation(
                     None,
                     AgentViewEntryOrigin::CloudAgent,
