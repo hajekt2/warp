@@ -708,12 +708,21 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
                 let Some(exchange) = conversation.latest_exchange() else {
                     return false;
                 };
+                let has_visible_agent_view_ai_block =
+                    view.rich_content_views.iter().any(|rich_content| {
+                        rich_content.agent_view_conversation_id() == Some(conversation.id())
+                            && rich_content.ai_block_metadata().is_some_and(|metadata| {
+                                metadata.conversation_id == conversation.id()
+                                    && metadata.exchange_id == exchange.id
+                            })
+                    });
                 view.active_conversation_id(ctx) == Some(conversation.id())
                     && view.agent_view_controller().as_ref(ctx).is_active()
+                    && has_visible_agent_view_ai_block
                     && exchange.output_status.is_finished_and_successful()
                     && exchange.format_output_for_copy(None).contains("echo: test")
             }),
-            "configured ACP login fixture should finish the submit loop, select the completed conversation, and stream output instead of calling authenticate"
+            "configured ACP login fixture should finish the submit loop, keep the AI block visible in agent view, and stream output instead of calling authenticate"
         );
 
         let _ = fs::remove_file(script_path);

@@ -310,6 +310,24 @@ impl TerminalView {
                     *conversation_id,
                     ctx,
                 );
+                // The local ACP history exchange is created before this view receives the
+                // conversation-ready event, so its AI block may have been inserted while
+                // terminal mode was still active. Full-screen agent view hides rich content
+                // that is not tagged with the active conversation; retag the ACP exchange
+                // block now that the conversation is active.
+                let local_acp_ai_block_view_ids = self
+                    .rich_content_views
+                    .iter()
+                    .filter_map(|rich_content| {
+                        rich_content
+                            .ai_block_metadata()
+                            .is_some_and(|metadata| metadata.conversation_id == *conversation_id)
+                            .then_some(rich_content.view_id())
+                    })
+                    .collect::<Vec<_>>();
+                for view_id in local_acp_ai_block_view_ids {
+                    self.set_rich_content_agent_view_conversation_id(view_id, *conversation_id);
+                }
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::UpdatedSetupCommandVisibility => (),
