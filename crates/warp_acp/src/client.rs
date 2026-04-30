@@ -371,11 +371,18 @@ mod tests {
 
     #[test]
     fn sends_session_lifecycle_requests() {
-        struct StaticThenBlock(Cursor<Vec<u8>>);
+        struct ResponseAfterRequestWrite {
+            response: Cursor<Vec<u8>>,
+            captured_writes: Arc<Mutex<Vec<u8>>>,
+        }
 
-        impl Read for StaticThenBlock {
+        impl Read for ResponseAfterRequestWrite {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.0.read(buf)?;
+                while self.captured_writes.lock().unwrap().is_empty() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+
+                let n = self.response.read(buf)?;
                 if n == 0 {
                     std::thread::sleep(Duration::from_secs(60));
                 }
@@ -388,7 +395,10 @@ mod tests {
             let captured = Arc::clone(&writer.0);
             (
                 AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
-                    StaticThenBlock(Cursor::new(response.to_vec())),
+                    ResponseAfterRequestWrite {
+                        response: Cursor::new(response.to_vec()),
+                        captured_writes: Arc::clone(&captured),
+                    },
                     writer,
                     None,
                 )),

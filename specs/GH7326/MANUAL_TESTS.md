@@ -52,4 +52,11 @@ Run:
 cargo test -p warp_acp
 cargo check -p warp
 cargo check -p warp --features acp_client
+cargo test -p warp acp --features acp_client
 ```
+
+## Integration coverage
+
+`test_acp_streaming_exchange_renders_in_agent_history` is registered in the Warp integration suite. It injects an ACP-style streaming exchange through `BlocklistAIHistoryModel::start/update/finish_acp_streaming_exchange` and asserts that the latest agent-history exchange renders the final streamed text.
+
+Local note: `cargo check -p integration` was attempted on 2026-04-30 but this machine's `minimp4-sys`/bindgen toolchain cannot find clang's `stddef.h`; the app crate and ACP unit checks compile independently.

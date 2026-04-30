@@ -1,6 +1,7 @@
 use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use futures::channel::oneshot;
+use warp_acp::{McpServer, McpServerSse, McpServerStdio};
 use warp_cli::agent::Harness;
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -9,7 +10,7 @@ use warp_cli::{
 use warp_core::channel::ChannelState;
 
 use super::{
-    IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
+    AgentDriver, IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
     LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
     OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
@@ -107,6 +108,46 @@ fn test_normalize_sse_server_with_headers() {
         server["headers"]["Authorization"].as_str().unwrap(),
         "Bearer token"
     );
+}
+
+#[test]
+fn acp_mcp_explicit_stdio_allowlist_entry_parses_as_argv() {
+    let server = AgentDriver::parse_acp_mcp_server("local-tools | /bin/echo hello world")
+        .expect("explicit ACP MCP allowlist entry should parse");
+
+    let McpServer::Stdio(server) = server else {
+        panic!("expected stdio MCP server");
+    };
+    assert_eq!(server.name, "local-tools");
+    assert_eq!(server.command, std::path::PathBuf::from("/bin/echo"));
+    assert_eq!(server.args, &["hello", "world"]);
+}
+
+#[test]
+fn acp_mcp_bare_allowlist_entry_is_reserved_for_installed_servers() {
+    assert!(AgentDriver::parse_acp_mcp_server("installed-server-name").is_none());
+    assert!(AgentDriver::parse_acp_mcp_server("*").is_none());
+}
+
+#[test]
+fn acp_mcp_capability_filter_gates_non_stdio_transports() {
+    let servers = vec![
+        McpServer::Stdio(McpServerStdio::new("stdio", "/bin/echo")),
+        McpServer::Sse(McpServerSse::new("sse", "https://example.test/sse")),
+    ];
+
+    let filtered = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
+        servers.clone(),
+        &serde_json::json!({"mcpCapabilities":{"sse": false}}),
+    );
+    assert_eq!(filtered.len(), 1);
+    assert!(matches!(filtered[0], McpServer::Stdio(_)));
+
+    let filtered = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
+        servers,
+        &serde_json::json!({"mcpCapabilities":{"sse": true}}),
+    );
+    assert_eq!(filtered.len(), 2);
 }
 
 // ── IdleTimeoutSender tests ──────────────────────────────────────────────────────

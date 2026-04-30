@@ -23,7 +23,7 @@ Warp should let users configure local Agent Client Protocol (ACP) agents and run
 ## Deferred UI Surfaces
 
 - Warp as an ACP server and remote HTTP/WebSocket ACP transport remain protocol-crate follow-ups because this feature is a local stdio ACP client.
-- Auto-forwarding all MCP servers remains blocked by security review; configured per-agent MCP allowlist entries can forward explicit stdio commands or named/UUID Warp-installed MCP servers. SSE MCP forwarding is sent only when the ACP agent advertises `mcpCapabilities.sse`.
+- Auto-forwarding all MCP servers remains blocked by security review; configured per-agent MCP allowlist entries can forward explicit stdio commands or named/UUID Warp-installed MCP servers, or `*` for an explicit all-installed-server opt-in. SSE MCP forwarding is sent only when the ACP agent advertises `mcpCapabilities.sse`.
 - True rendered-history-to-agent resume needs a dedicated product surface even though protocol `session/load`/`session/resume` calls are now available.
 
 ## Success Criteria

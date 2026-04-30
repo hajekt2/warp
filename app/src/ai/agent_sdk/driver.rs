@@ -1673,9 +1673,11 @@ impl AgentDriver {
     ) -> Vec<McpServer> {
         let mut servers = Vec::new();
         for entry in allowlist {
-            servers.extend(Self::acp_mcp_servers_from_installed_allowlist_entry(
-                entry, ctx,
-            ));
+            let installed = Self::acp_mcp_servers_from_installed_allowlist_entry(entry, ctx);
+            if !installed.is_empty() {
+                servers.extend(installed);
+                continue;
+            }
             if let Some(server) = Self::parse_acp_mcp_server(entry) {
                 servers.push(server);
             }
@@ -1693,6 +1695,14 @@ impl AgentDriver {
         }
 
         let manager = TemplatableMCPServerManager::as_ref(ctx);
+        if entry == "*" {
+            return manager
+                .get_installed_templatable_servers()
+                .values()
+                .flat_map(Self::acp_mcp_servers_from_installation)
+                .collect();
+        }
+
         let installation = entry
             .parse::<Uuid>()
             .ok()
@@ -1707,10 +1717,14 @@ impl AgentDriver {
                     })
             });
 
-        let Some(installation) = installation else {
-            return Vec::new();
-        };
+        installation
+            .map(Self::acp_mcp_servers_from_installation)
+            .unwrap_or_default()
+    }
 
+    fn acp_mcp_servers_from_installation(
+        installation: &TemplatableMCPServerInstallation,
+    ) -> Vec<McpServer> {
         let resolved_json = resolve_json(installation);
         let Ok(parsed_servers) = WarpMCPServer::from_user_json(&resolved_json) else {
             log::warn!(
@@ -1801,8 +1815,7 @@ impl AgentDriver {
         let (name, argv) = entry
             .split_once('|')
             .or_else(|| entry.split_once('='))
-            .map(|(name, argv)| (name.trim().to_string(), argv.trim().to_string()))
-            .unwrap_or_else(|| (entry.to_string(), entry.to_string()));
+            .map(|(name, argv)| (name.trim().to_string(), argv.trim().to_string()))?;
         let argv = shell_words::split(&argv).ok()?;
         let (command, args) = argv.split_first()?;
         Some(McpServer::Stdio(

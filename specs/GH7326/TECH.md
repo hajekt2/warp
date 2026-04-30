@@ -42,4 +42,4 @@ ACP client support remains guarded by `FeatureFlag::AcpClient`, but `acp_client`
 - Settings tests for serialization, feature gating, and local-only ACP config storage.
 - UI model/selector tests for built-in and configured ACP entries.
 - Integration fixture binary for ACP initialize/session/new/session/prompt echo.
-- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, streaming output into a Warp block, MCP allowlist by explicit argv and installed server UUID/name, fs read/write bridge, terminal lifecycle bridge, and session list/load/resume/close protocol calls.
+- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, streaming output into a Warp block, MCP allowlist by explicit argv and installed server UUID/name/`*`, fs read/write bridge, terminal lifecycle bridge, and session list/load/resume/close protocol calls.
