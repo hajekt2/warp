@@ -26180,7 +26180,7 @@ impl View for TerminalView {
             context.set.insert(flags::HAS_PENDING_PROMPT_SUGGESTION);
         }
 
-        if AISettings::as_ref(app).is_any_ai_enabled(app) {
+        if AISettings::as_ref(app).is_local_agent_entrypoint_enabled(app) {
             context.set.insert(flags::IS_ANY_AI_ENABLED);
         }
 

@@ -14207,7 +14207,7 @@ impl View for Input {
             ctx.set.insert(flags::EMPTY_INPUT_BUFFER);
         }
 
-        if ai_settings.is_any_ai_enabled(app) {
+        if ai_settings.is_local_agent_entrypoint_enabled(app) {
             ctx.set.insert(flags::IS_ANY_AI_ENABLED);
         }
 

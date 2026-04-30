@@ -438,6 +438,26 @@ fn test_configured_acp_agents_are_feature_gated() {
 }
 
 #[test]
+fn test_configured_acp_agents_enable_local_agent_entrypoints() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(!settings.has_configured_local_acp_agents());
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.has_configured_local_acp_agents());
+        });
+    });
+}
+
+#[test]
 fn test_add_and_remove_acp_agent_from_registry() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
