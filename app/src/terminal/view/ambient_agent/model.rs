@@ -1,7 +1,17 @@
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use anyhow::{anyhow, Context as _};
 use instant::Instant;
 use session_sharing_protocol::common::SessionId;
+use warp_acp::{
+    AcpClient, AgentMessage, AuthenticateRequest, ClientCapabilities, ContentBlock,
+    FileSystemCapabilities, Implementation, InitializeRequest, LocalClientRequestHandler,
+    LocalClientRequestPolicy, NewSessionRequest,
+};
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
@@ -10,7 +20,10 @@ use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::AIAgentOutput;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
+use crate::ai::agent_sdk::driver::{AcpStreamingOutputBuilder, AgentDriver};
+use crate::ai::agent_sdk::validate_cli_installed;
 use crate::ai::ambient_agents::spawn::{spawn_task, AmbientAgentEvent};
 use crate::ai::ambient_agents::task::HarnessConfig;
 use crate::ai::ambient_agents::telemetry::CloudAgentTelemetryEvent;
@@ -18,7 +31,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::{
     OUT_OF_CREDITS_TASK_FAILURE_MESSAGE, SERVER_OVERLOADED_TASK_FAILURE_MESSAGE,
 };
-use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::execution_profiles::{CloudAgentComputerUseState, ComputerUsePermission};
 use crate::ai::llms::{LLMId, LLMPreferences};
@@ -29,7 +42,7 @@ use crate::server::server_api::ai::{
     AgentConfigSnapshot, AmbientAgentTaskState, AttachmentInput, SpawnAgentRequest,
 };
 use crate::server::server_api::{AIApiError, CloudAgentCapacityError, ServerApiProvider};
-use crate::settings::ai::AcpAgentId;
+use crate::settings::ai::{AISettings, AcpAgentId};
 use crate::terminal::view::ambient_agent::SetupCommandState;
 
 use super::AmbientAgentProgressUIState;
@@ -509,6 +522,240 @@ impl AmbientAgentViewModel {
     /// Sets the local conversation ID associated with this cloud agent run.
     pub fn set_conversation_id(&mut self, id: Option<AIConversationId>) {
         self.conversation_id = id;
+    }
+
+    /// Spawn a configured local ACP agent directly in this terminal's agent history.
+    ///
+    /// ACP agents are local stdio subprocesses, not cloud environments. They must not route
+    /// through `spawn_task` because that requires Warp-hosted AI auth and a server task.
+    pub fn spawn_local_acp_agent(
+        &mut self,
+        prompt: String,
+        attachments: Vec<AttachmentInput>,
+        working_dir: PathBuf,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let AgentHarnessSelection::Acp(agent_id) = self.harness_selection.clone() else {
+            self.spawn_agent(prompt, attachments, ctx);
+            return;
+        };
+
+        if !attachments.is_empty() {
+            log::warn!(
+                "Ignoring {} attachment(s) for local ACP prompt",
+                attachments.len()
+            );
+        }
+
+        let Some(config) = AISettings::as_ref(ctx).acp_agent_config(&agent_id).cloned() else {
+            self.handle_spawn_error(
+                format!("Configured ACP agent '{agent_id}' was not found."),
+                ctx,
+            );
+            return;
+        };
+
+        if let Err(error) = validate_cli_installed(&config.command, config.install_url.as_deref()) {
+            self.handle_spawn_error(error.to_string(), ctx);
+            return;
+        }
+
+        let command = match config.to_launch_command() {
+            Ok(command) => command,
+            Err(error) => {
+                self.handle_spawn_error(error.to_string(), ctx);
+                return;
+            }
+        };
+
+        let permissions = BlocklistAIPermissions::as_ref(ctx);
+        let terminal_view_id = self.terminal_view_id;
+        let read_files_setting = permissions.get_read_files_setting(ctx, Some(terminal_view_id));
+        let apply_diffs_setting =
+            permissions.get_apply_code_diffs_setting(ctx, Some(terminal_view_id));
+        let execute_commands_setting =
+            permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
+        let request_policy = LocalClientRequestPolicy {
+            workspace_root: working_dir.clone(),
+            allow_read_text_file: !read_files_setting.is_always_ask(),
+            allow_write_text_file: apply_diffs_setting.is_always_allow(),
+            allow_terminal: execute_commands_setting.is_always_allow(),
+            allow_permission_selection: apply_diffs_setting.is_always_allow()
+                || execute_commands_setting.is_always_allow(),
+        };
+        let mcp_servers = AgentDriver::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
+        let foreground = ctx.spawner();
+
+        self.status = Status::AgentRunning;
+        ctx.emit(AmbientAgentViewModelEvent::DispatchedAgent);
+
+        ctx.spawn(
+            async move {
+                let prompt_for_history = prompt.clone();
+                let working_dir_for_history = working_dir.clone();
+                let stream_handle = foreground
+                    .spawn(move |_, ctx| {
+                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                            history.start_acp_streaming_exchange(
+                                terminal_view_id,
+                                prompt_for_history,
+                                Some(working_dir_for_history.display().to_string()),
+                                ctx,
+                            )
+                        })
+                    })
+                    .await?
+                    .map_err(|error| anyhow!(error))?;
+
+                let (output_tx, mut output_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
+                let acp_run = tokio::task::spawn_blocking(move || {
+                    let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
+                    let fs_capabilities = match (
+                        request_policy.allow_read_text_file,
+                        request_policy.allow_write_text_file,
+                    ) {
+                        (true, true) => FileSystemCapabilities::read_write(),
+                        (true, false) => FileSystemCapabilities::read_only(),
+                        _ => FileSystemCapabilities::none(),
+                    };
+                    let initialize_response = client
+                        .initialize_with(InitializeRequest::new(
+                            Some(
+                                Implementation::new("Warp")
+                                    .with_version(env!("CARGO_PKG_VERSION")),
+                            ),
+                            ClientCapabilities::conservative()
+                                .with_file_system(fs_capabilities)
+                                .with_terminal(request_policy.allow_terminal),
+                        ))
+                        .map_err(anyhow::Error::from)?;
+                    if let Some(method_id) =
+                        AgentDriver::preferred_acp_auth_method(&initialize_response.auth_methods)
+                    {
+                        client
+                            .authenticate(AuthenticateRequest::new(method_id.clone()))
+                            .with_context(|| {
+                                format!("ACP authentication failed for method `{method_id}`")
+                            })?;
+                    }
+                    let mcp_servers = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
+                        mcp_servers,
+                        &initialize_response.agent_capabilities,
+                    );
+                    let session = client
+                        .new_session(NewSessionRequest::new(working_dir).with_mcp_servers(mcp_servers))
+                        .map_err(anyhow::Error::from)?;
+                    let session_id = session.session_id.clone();
+                    let mut request_handler = LocalClientRequestHandler::new(request_policy)
+                        .map_err(|error| anyhow!(error))?;
+                    let output = Arc::new(Mutex::new(AcpStreamingOutputBuilder::default()));
+                    let output_for_notifications = Arc::clone(&output);
+                    client
+                        .prompt_with_agent_message_and_request_handler(
+                            session.session_id,
+                            vec![ContentBlock::text(prompt)],
+                            move |message: AgentMessage| {
+                                if let Some(update) = AgentDriver::acp_session_update(&message) {
+                                    let mut builder = output_for_notifications
+                                        .lock()
+                                        .expect("ACP output builder poisoned");
+                                    if builder.apply_update(update) {
+                                        let _ = output_tx.send(builder.output());
+                                    }
+                                }
+                            },
+                            move |message, transport| request_handler.handle(message, transport),
+                        )
+                        .map_err(anyhow::Error::from)?;
+                    let _ = client.close_session(session_id);
+                    let output = output.lock().expect("ACP output builder poisoned").output();
+                    Ok::<_, anyhow::Error>(output)
+                });
+
+                tokio::pin!(acp_run);
+                let output_text = loop {
+                    tokio::select! {
+                        maybe_output = output_rx.recv() => {
+                            if let Some(output) = maybe_output {
+                                let handle = stream_handle.clone();
+                                foreground
+                                    .spawn(move |_, ctx| {
+                                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                                            history.update_acp_streaming_exchange_output(
+                                                terminal_view_id,
+                                                &handle,
+                                                output,
+                                                ctx,
+                                            )
+                                        })
+                                    })
+                                    .await?
+                                    .map_err(|error| anyhow!(error))?;
+                            }
+                        }
+                        result = &mut acp_run => {
+                            break result
+                                .map_err(|error| anyhow!(error))?
+                                .unwrap_or_else(|error| {
+                                    AcpStreamingOutputBuilder::error_output(format!(
+                                        "ACP agent failed: {error:#}"
+                                    ))
+                                });
+                        }
+                    }
+                };
+
+                while let Ok(output) = output_rx.try_recv() {
+                    let handle = stream_handle.clone();
+                    foreground
+                        .spawn(move |_, ctx| {
+                            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                                history.update_acp_streaming_exchange_output(
+                                    terminal_view_id,
+                                    &handle,
+                                    output,
+                                    ctx,
+                                )
+                            })
+                        })
+                        .await?
+                        .map_err(|error| anyhow!(error))?;
+                }
+
+                let final_output = if output_text.messages.is_empty() {
+                    AcpStreamingOutputBuilder::error_output(
+                        "ACP agent completed without streamed text output.",
+                    )
+                } else {
+                    output_text
+                };
+                foreground
+                    .spawn(move |_, ctx| {
+                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                            history.update_acp_streaming_exchange_output(
+                                terminal_view_id,
+                                &stream_handle,
+                                final_output,
+                                ctx,
+                            )?;
+                            history.finish_acp_streaming_exchange_current_output(
+                                terminal_view_id,
+                                &stream_handle,
+                                ctx,
+                            )
+                        })
+                    })
+                    .await?
+                    .map_err(|error| anyhow!(error))?;
+                Ok::<_, anyhow::Error>(())
+            },
+            |me, result, ctx| {
+                if let Err(error) = result {
+                    me.handle_spawn_error(format!("ACP agent failed: {error:#}"), ctx);
+                }
+            },
+        );
     }
 
     /// Spawn an ambient agent with the given prompt and current session configuration.

@@ -640,9 +640,7 @@ impl AgentDriverRunner {
             }
 
             match &task.harness {
-                HarnessKind::Acp(harness) => {
-                    return Err(harness.setup_error());
-                }
+                HarnessKind::Acp(_) => {}
                 HarnessKind::Unsupported(harness) => {
                     return Err(AgentDriverError::HarnessSetupFailed {
                         harness: harness.to_string(),

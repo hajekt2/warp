@@ -5906,6 +5906,15 @@ impl Input {
             })
     }
 
+    fn current_working_dir_for_local_agent(&self) -> PathBuf {
+        self.active_block_metadata
+            .as_ref()
+            .and_then(BlockMetadata::current_working_directory)
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Try to execute a command in the local session that was
     /// requested by a shared session participant (sharer or viewer).
     ///
@@ -11924,9 +11933,15 @@ impl Input {
                     context_model.clear_pending_attachments(ctx);
                 });
 
+                let is_local_acp_agent = self.is_configuring_configured_acp_agent(ctx);
+                let working_dir = self.current_working_dir_for_local_agent();
                 if let Some(ambient_agent_view_model) = self.ambient_agent_view_model() {
                     ambient_agent_view_model.update(ctx, |state, ctx| {
-                        state.spawn_agent(prompt, attachments, ctx);
+                        if is_local_acp_agent {
+                            state.spawn_local_acp_agent(prompt, attachments, working_dir, ctx);
+                        } else {
+                            state.spawn_agent(prompt, attachments, ctx);
+                        }
                     });
                 }
                 return;

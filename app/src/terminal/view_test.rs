@@ -551,7 +551,7 @@ fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
 
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
             report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
-            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            settings.add_custom_acp_agent_config("Test ACP", "true", vec![], ctx);
             assert!(!settings.is_any_ai_enabled(ctx));
             assert!(settings.is_local_agent_entrypoint_enabled(ctx));
         });
@@ -564,7 +564,7 @@ fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
                 .expect("cloud mode terminal should have ambient model")
                 .update(ctx, |model, ctx| {
                     model.set_harness_selection(
-                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("opencode")),
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("test-acp")),
                         ctx,
                     );
                     assert!(model.is_configuring_ambient_agent());
@@ -589,8 +589,8 @@ fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
                 view.ambient_agent_view_model()
                     .expect("cloud mode terminal should have ambient model")
                     .as_ref(ctx)
-                    .is_waiting_for_session(),
-                "Enter should dispatch the configured ACP agent instead of being swallowed"
+                    .is_agent_running(),
+                "Enter should dispatch the configured ACP agent locally instead of starting a cloud environment"
             );
         });
     });

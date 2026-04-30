@@ -298,7 +298,7 @@ pub struct AgentDriver {
 }
 
 #[derive(Default)]
-struct AcpStreamingOutputBuilder {
+pub(crate) struct AcpStreamingOutputBuilder {
     messages: Vec<AIAgentOutputMessage>,
     agent_text: String,
     agent_text_message_id: Option<MessageId>,
@@ -308,7 +308,7 @@ struct AcpStreamingOutputBuilder {
 }
 
 impl AcpStreamingOutputBuilder {
-    fn apply_update(&mut self, update: SessionUpdate) -> bool {
+    pub(crate) fn apply_update(&mut self, update: SessionUpdate) -> bool {
         match update {
             SessionUpdate::AgentMessageChunk { text } => {
                 self.agent_text.push_str(&text);
@@ -346,14 +346,14 @@ impl AcpStreamingOutputBuilder {
         }
     }
 
-    fn output(&self) -> AIAgentOutput {
+    pub(crate) fn output(&self) -> AIAgentOutput {
         AIAgentOutput {
             messages: self.messages.clone(),
             ..Default::default()
         }
     }
 
-    fn error_output(message: impl Into<String>) -> AIAgentOutput {
+    pub(crate) fn error_output(message: impl Into<String>) -> AIAgentOutput {
         AIAgentOutput {
             messages: vec![AIAgentOutputMessage::debug_output(
                 MessageId::new("acp-error".to_string()),
@@ -1836,9 +1836,9 @@ impl AgentDriver {
         Ok(())
     }
 
-    fn acp_mcp_servers_from_allowlist(
+    pub(crate) fn acp_mcp_servers_from_allowlist(
         allowlist: &[String],
-        ctx: &mut ModelContext<Self>,
+        ctx: &AppContext,
     ) -> Vec<McpServer> {
         let mut servers = Vec::new();
         for entry in allowlist {
@@ -1856,7 +1856,7 @@ impl AgentDriver {
 
     fn acp_mcp_servers_from_installed_allowlist_entry(
         entry: &str,
-        ctx: &mut ModelContext<Self>,
+        ctx: &AppContext,
     ) -> Vec<McpServer> {
         let entry = entry.trim();
         if entry.is_empty() || entry.contains('|') || entry.contains('=') {
@@ -1937,7 +1937,7 @@ impl AgentDriver {
         }
     }
 
-    fn filter_acp_mcp_servers_for_agent_capabilities(
+    pub(crate) fn filter_acp_mcp_servers_for_agent_capabilities(
         servers: Vec<McpServer>,
         agent_capabilities: &Value,
     ) -> Vec<McpServer> {
@@ -1992,7 +1992,7 @@ impl AgentDriver {
         ))
     }
 
-    fn preferred_acp_auth_method(auth_methods: &[Value]) -> Option<String> {
+    pub(crate) fn preferred_acp_auth_method(auth_methods: &[Value]) -> Option<String> {
         auth_methods.iter().find_map(|method| {
             method
                 .get("methodId")
@@ -2003,7 +2003,7 @@ impl AgentDriver {
         })
     }
 
-    fn acp_session_update(message: &AgentMessage) -> Option<SessionUpdate> {
+    pub(crate) fn acp_session_update(message: &AgentMessage) -> Option<SessionUpdate> {
         let AgentMessage::Notification { method, params } = message else {
             return None;
         };
