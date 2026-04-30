@@ -5,7 +5,7 @@
 - `cargo test -p warp_acp` builds and runs `echo_acp_agent`, a deterministic stdio ACP fixture.
 - Coverage: `initialize`, `session/new`, `session/prompt`, one `session/update` notification, final `end_turn` response, schema serialization for `session/load`/permission outcomes, and the local fs/terminal request handler.
 - 2026-04-30 final verification: passed with
-  `BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo test -p warp_acp`
+  `cargo test -p warp_acp`
   (`29` unit tests, `echo_fixture_completes_initialize_session_and_prompt`, and doctests).
 
 ## Local ACP CLI smoke checks
@@ -70,11 +70,11 @@ Automated unit coverage now exercises:
 Run:
 
 ```bash
-BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo test -p warp_acp
-BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo check -p warp
-BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo check -p warp --features acp_client
-BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo test -p warp acp --features acp_client
-BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" cargo test -p warp acp_mcp --features acp_client
+cargo test -p warp_acp
+cargo check -p warp
+cargo check -p warp --features acp_client
+cargo test -p warp acp --features acp_client
+cargo test -p warp acp_mcp --features acp_client
 ```
 
 2026-04-30 final verification:
@@ -100,15 +100,11 @@ MCP forwarding evidence:
 
 2026-04-30 final verification:
 
-- Toolchain unblock: this machine has `libclang1-18` but no `clang` resource headers. Since `sudo` is unavailable, the working local fix is to point bindgen at GCC's resource headers:
-  `BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`.
-- `cargo check -p integration`: passed with that environment variable.
-- `cargo test -p integration test_acp_streaming_exchange_renders_in_agent_history -- --nocapture`: compiled and launched the registered test, but local execution is blocked by the host environment having no display server (`DISPLAY`/`WAYLAND_DISPLAY` unset, no `Xvfb` installed). The failure occurs while creating the winit event loop:
-  `should be able to create event loop: NotSupported(NotSupportedError)`.
-  This is an environment/display blocker, not an ACP compile or assertion failure.
+- Toolchain/display unblock: after installing `clang-18`, clang resource headers, `xvfb`, and `libxkbcommon-x11`, `cargo check -p integration` passes without `BINDGEN_EXTRA_CLANG_ARGS`.
+- `xvfb-run -a env WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS=1 cargo test -p integration test_acp_streaming_exchange_renders_in_agent_history -- --nocapture`: passed (`1` test; `274` filtered out). Evidence: the test ran all four steps and `Latest ACP exchange contains final streamed output` succeeded.
 
 ## UI/manual limitations in this environment
 
-- Full Warp UI selection tests for OpenCode/Codex ACP, approval dialogs, and visible MCP forwarding controls require a desktop display. This container has no `DISPLAY`, no `WAYLAND_DISPLAY`, and no `Xvfb`, so real Warp window QA could not be completed locally.
+- Full interactive Warp UI selection tests for OpenCode/Codex ACP, approval dialogs, and visible MCP forwarding controls require a desktop session. Headless integration coverage now runs under `xvfb-run`, but manual click-through QA was not completed in this container.
 - Protocol-level live-agent QA was completed over stdio for OpenCode and Codex ACP as documented above.
 - Approval-flow behavior is covered by `cargo test -p warp_acp`: workspace-contained file read, outside-workspace denial, enabled workspace file write, permission cancellation/selection schema, disabled filesystem request rejection before response, terminal command execution and output reporting through `LocalClientRequestHandler`.
