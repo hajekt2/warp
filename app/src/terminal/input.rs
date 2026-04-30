@@ -5894,6 +5894,18 @@ impl Input {
             })
     }
 
+    fn is_configuring_configured_acp_agent(&self, app: &AppContext) -> bool {
+        self.ambient_agent_view_model()
+            .is_some_and(|ambient_agent_model| {
+                let ambient_agent_model = ambient_agent_model.as_ref(app);
+                ambient_agent_model.is_configuring_ambient_agent()
+                    && ambient_agent_model
+                        .selected_harness_selection()
+                        .acp_agent_id()
+                        .is_some_and(|id| AISettings::as_ref(app).acp_agent_config(id).is_some())
+            })
+    }
+
     /// Try to execute a command in the local session that was
     /// requested by a shared session participant (sharer or viewer).
     ///
@@ -11801,9 +11813,11 @@ impl Input {
         } else if self.should_block_cloud_mode_setup_submission(ctx) {
             return;
         } else if FeatureFlag::AgentMode.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+            && (AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                || self.is_configuring_configured_acp_agent(ctx))
             && (self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
-                || self.is_cloud_mode_input_v2_composing(ctx))
+                || self.is_cloud_mode_input_v2_composing(ctx)
+                || self.is_configuring_configured_acp_agent(ctx))
         {
             // If we're submitting an AI query, we want to send telemetry for the input type.
             if FeatureFlag::NldImprovements.is_enabled() {

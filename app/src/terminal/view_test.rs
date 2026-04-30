@@ -27,7 +27,7 @@ use crate::{
 use crate::context_chips::prompt::Prompt;
 use crate::editor::{AutosuggestionLocation, AutosuggestionType};
 
-use crate::settings::{AISettings, AppEditorSettings, WarpPromptSeparator};
+use crate::settings::{AISettings, AcpAgentId, AppEditorSettings, WarpPromptSeparator};
 
 use crate::ai::blocklist::agent_view::toolbar_item::AgentToolbarItemKind;
 use crate::ai::blocklist::{
@@ -535,6 +535,63 @@ fn set_input_mode_agent_enters_agent_view_when_local_acp_is_configured() {
             assert!(!view.agent_view_controller().as_ref(ctx).is_active());
             view.handle_action(&TerminalAction::SetInputModeAgent, ctx);
             assert!(view.agent_view_controller().as_ref(ctx).is_active());
+        });
+    });
+}
+
+#[test]
+fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_local_agent_entrypoint_enabled(ctx));
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("opencode")),
+                        ctx,
+                    );
+                    assert!(model.is_configuring_ambient_agent());
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.buffer_text(ctx).is_empty(),
+                "submitted ACP prompt should clear the input buffer"
+            );
+        });
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.ambient_agent_view_model()
+                    .expect("cloud mode terminal should have ambient model")
+                    .as_ref(ctx)
+                    .is_waiting_for_session(),
+                "Enter should dispatch the configured ACP agent instead of being swallowed"
+            );
         });
     });
 }
