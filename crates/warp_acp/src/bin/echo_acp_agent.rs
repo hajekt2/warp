@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let require_auth = std::env::var_os("ECHO_ACP_REQUIRE_AUTH").is_some();
+    let mut authenticated = !require_auth;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -23,10 +25,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "protocolVersion": 1,
                     "agentCapabilities": {},
                     "agentInfo": { "name": "echo-acp-agent", "version": "test" },
-                    "authMethods": []
+                    "authMethods": if require_auth { json!([{ "methodId": "echo-token" }]) } else { json!([]) }
                 }),
             )?,
-            "session/new" => respond(&mut stdout, id, json!({ "sessionId": "echo-session" }))?,
+            "authenticate" => {
+                authenticated = request["params"]["methodId"] == "echo-token";
+                if authenticated {
+                    respond(&mut stdout, id, json!({}))?;
+                } else {
+                    respond_error(&mut stdout, id, -32003, "unsupported auth method")?;
+                }
+            }
+            "session/new" if authenticated => {
+                respond(&mut stdout, id, json!({ "sessionId": "echo-session" }))?
+            }
+            "session/new" => respond_error(&mut stdout, id, -32004, "authentication required")?,
             "session/prompt" => {
                 let text = request["params"]["prompt"]
                     .as_array()
@@ -66,6 +79,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn respond_error(
+    stdout: &mut impl Write,
+    id: Option<Value>,
+    code: i64,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(id) = id {
+        write_json_line(
+            stdout,
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+        )?;
     }
     Ok(())
 }

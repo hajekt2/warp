@@ -2662,6 +2662,7 @@ impl AIConversation {
         Ok((exchange_id, message_id))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn update_streaming_text_exchange(
         &mut self,
         exchange_id: AIAgentExchangeId,
@@ -2710,6 +2711,33 @@ impl AIConversation {
         Ok(())
     }
 
+    pub(crate) fn replace_streaming_exchange_output(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        output: AIAgentOutput,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming {
+            output: Some(streaming_output),
+        } = &exchange.output_status
+        else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        *streaming_output.get_mut() = output;
+
+        let conversation_id = self.id;
+        let is_hidden = self.is_exchange_hidden(exchange_id);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden,
+        });
+        Ok(())
+    }
+
     pub(crate) fn finish_streaming_text_exchange(
         &mut self,
         exchange_id: AIAgentExchangeId,
@@ -2738,6 +2766,7 @@ impl AIConversation {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_finished_text_exchange(
         &mut self,
         input: Vec<AIAgentInput>,

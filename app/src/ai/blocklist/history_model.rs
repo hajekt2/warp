@@ -40,8 +40,9 @@ use crate::GlobalResourceHandlesProvider;
 use crate::{
     ai::agent::{
         conversation::{AIConversation, AIConversationId},
-        AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutputStatus, FinishedAIAgentOutput,
-        MessageId, RenderableAIError, RequestCost, Suggestions, UserQueryMode,
+        AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutput, AIAgentOutputStatus,
+        FinishedAIAgentOutput, MessageId, RenderableAIError, RequestCost, Suggestions,
+        UserQueryMode,
     },
     persistence::model::AgentConversation,
     ui_components::icons::Icon,
@@ -66,6 +67,7 @@ pub(super) const MAX_HISTORICAL_CONVERSATIONS: usize = 100;
 pub(crate) struct AcpStreamingExchangeHandle {
     pub(crate) conversation_id: AIConversationId,
     pub(crate) exchange_id: AIAgentExchangeId,
+    #[allow(dead_code)]
     pub(crate) message_id: MessageId,
 }
 
@@ -858,6 +860,7 @@ impl BlocklistAIHistoryModel {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn update_acp_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,
@@ -881,6 +884,29 @@ impl BlocklistAIHistoryModel {
         Ok(())
     }
 
+    pub(crate) fn update_acp_streaming_exchange_output(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &AcpStreamingExchangeHandle,
+        output: AIAgentOutput,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.replace_streaming_exchange_output(
+            handle.exchange_id,
+            output,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn finish_acp_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,
@@ -889,6 +915,22 @@ impl BlocklistAIHistoryModel {
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
         self.update_acp_streaming_exchange(terminal_view_id, handle, output_text, ctx)?;
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.finish_streaming_text_exchange(handle.exchange_id, terminal_view_id, ctx)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_acp_streaming_exchange_current_output(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &AcpStreamingExchangeHandle,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
         let conversation = self
             .conversations_by_id
             .get_mut(&handle.conversation_id)

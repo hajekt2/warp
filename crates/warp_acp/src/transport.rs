@@ -4,8 +4,9 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use instant::Instant;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;

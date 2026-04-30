@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
+use command::blocking::Command;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -52,6 +53,8 @@ pub enum LocalClientRequestError {
     OutsideWorkspace { path: PathBuf, workspace: PathBuf },
     #[error("ACP client capability `{0}` is disabled")]
     Disabled(&'static str),
+    #[error("ACP client request `{0}` was denied by user")]
+    PermissionDenied(&'static str),
     #[error("ACP terminal `{0}` was not found")]
     UnknownTerminal(String),
     #[error("I/O error while handling ACP client request: {0}")]
@@ -64,6 +67,7 @@ impl LocalClientRequestError {
             Self::InvalidParams(_) => ERROR_INVALID_PARAMS,
             Self::OutsideWorkspace { .. } => ERROR_PERMISSION_DENIED,
             Self::Disabled(_) => ERROR_DISABLED,
+            Self::PermissionDenied(_) => ERROR_PERMISSION_DENIED,
             Self::UnknownTerminal(_) => ERROR_INVALID_PARAMS,
             Self::Io(_) => ERROR_INTERNAL,
         }
@@ -82,6 +86,57 @@ pub struct LocalClientRequestHandler {
     workspace_root: PathBuf,
     terminals: HashMap<String, LocalTerminal>,
     next_terminal_id: u64,
+    ui: Arc<dyn ClientRequestUi>,
+}
+
+pub trait ClientRequestUi: Send + Sync {
+    fn approve_write_text_file(
+        &self,
+        _request: &WriteTextFileRequest,
+        _resolved_path: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(true)
+    }
+
+    fn request_permission(
+        &self,
+        request: &RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, LocalClientRequestError>;
+
+    fn approve_terminal(
+        &self,
+        _request: &crate::schema::CreateTerminalRequest,
+        _resolved_cwd: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
+pub struct AutoClientRequestUi;
+
+impl ClientRequestUi for AutoClientRequestUi {
+    fn request_permission(
+        &self,
+        request: &RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, LocalClientRequestError> {
+        let selected = request
+            .options
+            .iter()
+            .find(|option| {
+                let label = option.name.to_lowercase();
+                label.contains("allow") || label.contains("approve") || label.contains("yes")
+            })
+            .or_else(|| request.options.first());
+        Ok(match selected {
+            Some(option) => RequestPermissionResponse {
+                outcome: RequestPermissionOutcome::Selected {
+                    option_id: option.option_id.clone(),
+                },
+            },
+            None => RequestPermissionResponse::cancelled(),
+        })
+    }
 }
 
 impl LocalClientRequestHandler {
@@ -92,7 +147,14 @@ impl LocalClientRequestHandler {
             workspace_root,
             terminals: HashMap::new(),
             next_terminal_id: 1,
+            ui: Arc::new(AutoClientRequestUi),
         })
+    }
+
+    #[must_use]
+    pub fn with_ui(mut self, ui: Arc<dyn ClientRequestUi>) -> Self {
+        self.ui = ui;
+        self
     }
 
     pub fn handle(
@@ -157,6 +219,11 @@ impl LocalClientRequestHandler {
         }
         let request: WriteTextFileRequest = serde_json::from_value(params)?;
         let path = self.resolve_workspace_path(&request.path, false)?;
+        if !self.ui.approve_write_text_file(&request, &path)? {
+            return Err(LocalClientRequestError::PermissionDenied(
+                "fs/write_text_file",
+            ));
+        }
         fs::write(path, request.content)?;
         Ok(WriteTextFileResponse {})
     }
@@ -169,22 +236,7 @@ impl LocalClientRequestHandler {
         if !self.policy.allow_permission_selection {
             return Ok(RequestPermissionResponse::cancelled());
         }
-        let selected = request
-            .options
-            .iter()
-            .find(|option| {
-                let label = option.name.to_lowercase();
-                label.contains("allow") || label.contains("approve") || label.contains("yes")
-            })
-            .or_else(|| request.options.first());
-        Ok(match selected {
-            Some(option) => RequestPermissionResponse {
-                outcome: RequestPermissionOutcome::Selected {
-                    option_id: option.option_id.clone(),
-                },
-            },
-            None => RequestPermissionResponse::cancelled(),
-        })
+        self.ui.request_permission(&request)
     }
 
     fn create_terminal(
@@ -195,10 +247,13 @@ impl LocalClientRequestHandler {
             return Err(LocalClientRequestError::Disabled("terminal/create"));
         }
         let request: crate::schema::CreateTerminalRequest = serde_json::from_value(params)?;
-        let cwd = match request.cwd {
-            Some(cwd) => self.resolve_workspace_path(&cwd, true)?,
+        let cwd = match &request.cwd {
+            Some(cwd) => self.resolve_workspace_path(cwd, true)?,
             None => self.workspace_root.clone(),
         };
+        if !self.ui.approve_terminal(&request, &cwd)? {
+            return Err(LocalClientRequestError::PermissionDenied("terminal/create"));
+        }
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
@@ -587,6 +642,75 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[derive(Default)]
+    struct RecordingUi {
+        writes: Arc<Mutex<Vec<PathBuf>>>,
+        allow_write: bool,
+    }
+
+    impl ClientRequestUi for RecordingUi {
+        fn approve_write_text_file(
+            &self,
+            _request: &WriteTextFileRequest,
+            resolved_path: &Path,
+        ) -> Result<bool, LocalClientRequestError> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push(resolved_path.to_path_buf());
+            Ok(self.allow_write)
+        }
+
+        fn request_permission(
+            &self,
+            _request: &RequestPermissionRequest,
+        ) -> Result<RequestPermissionResponse, LocalClientRequestError> {
+            Ok(RequestPermissionResponse::cancelled())
+        }
+    }
+
+    #[test]
+    fn write_request_waits_for_ui_decision() {
+        let dir = temp_dir();
+        let ui = Arc::new(RecordingUi {
+            writes: Arc::new(Mutex::new(Vec::new())),
+            allow_write: false,
+        });
+        let writes = Arc::clone(&ui.writes);
+        let mut handler = LocalClientRequestHandler::new(LocalClientRequestPolicy {
+            workspace_root: dir.clone(),
+            allow_read_text_file: false,
+            allow_write_text_file: true,
+            allow_terminal: false,
+            allow_permission_selection: false,
+        })
+        .unwrap()
+        .with_ui(ui);
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(Cursor::new(Vec::new()), writer, None);
+
+        handler
+            .handle(
+                AgentMessage::Request {
+                    id: JsonRpcId::Number(10),
+                    method: "fs/write_text_file".to_string(),
+                    params: json!({"sessionId":"s","path":"created.txt","content":"hello"}),
+                },
+                &transport,
+            )
+            .unwrap();
+
+        assert_eq!(writes.lock().unwrap().len(), 1);
+        assert!(!dir.join("created.txt").exists());
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains(r#""id":10"#));
+        assert!(written.contains(r#""code":-32002"#));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn runs_terminal_and_reports_output_and_exit() {
         let dir = temp_dir();

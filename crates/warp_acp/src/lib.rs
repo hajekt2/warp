@@ -23,7 +23,9 @@ mod transport;
 pub use client::{AcpClient, AcpClientError};
 pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
 pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
-pub use local_handler::{LocalClientRequestHandler, LocalClientRequestPolicy};
+pub use local_handler::{
+    AutoClientRequestUi, ClientRequestUi, LocalClientRequestHandler, LocalClientRequestPolicy,
+};
 pub use registry::{
     codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,
 };
@@ -37,9 +39,10 @@ pub use schema::{
     PermissionOption, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SessionId, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TerminalExitStatus, TerminalOutputResponse, TerminalRefRequest, TextContent,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    ResumeSessionResponse, SessionId, SessionUpdate, SessionUpdateNotification,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TerminalExitStatus, TerminalOutputResponse,
+    TerminalRefRequest, TextContent, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 pub use transport::{JsonRpcStdioTransport, JsonRpcTransportError};

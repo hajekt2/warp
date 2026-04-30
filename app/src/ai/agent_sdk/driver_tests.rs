@@ -1,7 +1,7 @@
 use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use futures::channel::oneshot;
-use warp_acp::{McpServer, McpServerSse, McpServerStdio};
+use warp_acp::{McpServer, McpServerSse, McpServerStdio, SessionUpdate};
 use warp_cli::agent::Harness;
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -10,9 +10,9 @@ use warp_cli::{
 use warp_core::channel::ChannelState;
 
 use super::{
-    AgentDriver, IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
-    LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    AcpStreamingOutputBuilder, AgentDriver, IdleTimeoutSender,
+    LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV, LEGACY_OZ_PARENT_STATE_ROOT_ENV,
+    OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
 use crate::ai::agent::{
     task::TaskId, AIAgentActionResult, AIAgentActionResultType, AIAgentInput, AIAgentOutput,
@@ -148,6 +148,75 @@ fn acp_mcp_capability_filter_gates_non_stdio_transports() {
         &serde_json::json!({"mcpCapabilities":{"sse": true}}),
     );
     assert_eq!(filtered.len(), 2);
+}
+
+#[test]
+fn acp_auth_method_prefers_method_id() {
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[
+            serde_json::json!({"methodId":"env-openai-api-key"}),
+            serde_json::json!({"id":"fallback"}),
+        ]),
+        Some("env-openai-api-key".to_string())
+    );
+}
+
+#[test]
+fn acp_streaming_output_builder_maps_structured_updates_to_warp_messages() {
+    let mut builder = AcpStreamingOutputBuilder::default();
+
+    assert!(builder.apply_update(SessionUpdate::AgentThoughtChunk {
+        text: "thinking".to_string(),
+    }));
+    assert!(builder.apply_update(SessionUpdate::AgentMessageChunk {
+        text: "hello".to_string(),
+    }));
+    assert!(builder.apply_update(SessionUpdate::ToolCall {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        args: serde_json::json!({"path":"README.md"}),
+    }));
+    assert!(builder.apply_update(SessionUpdate::Plan {
+        content: "1. Ship it".to_string(),
+    }));
+    assert!(!builder.apply_update(SessionUpdate::Unknown {
+        method: "future".to_string(),
+        params: serde_json::json!({"sessionUpdate":"future"}),
+    }));
+
+    let output = builder.output();
+
+    assert!(output
+        .text_from_agent_reasoning()
+        .any(|text| agent_text_contains(text, "thinking")));
+    assert!(output
+        .text_from_agent_output()
+        .any(|text| agent_text_contains(text, "hello")));
+    assert!(output.actions().any(|action| {
+        matches!(
+            &action.action,
+            crate::ai::agent::AIAgentActionType::CallMCPTool { name, .. } if name == "read_file"
+        )
+    }));
+    assert!(output
+        .text_from_agent_output()
+        .any(|text| agent_text_contains(text, "Ship it")));
+}
+
+fn agent_text_contains(text: &crate::ai::agent::AIAgentText, needle: &str) -> bool {
+    text.sections.iter().any(|section| match section {
+        crate::ai::agent::AIAgentTextSection::PlainText { text } => text.text().contains(needle),
+        crate::ai::agent::AIAgentTextSection::Code { code, .. } => code.contains(needle),
+        crate::ai::agent::AIAgentTextSection::Table { table } => {
+            table.markdown_source.contains(needle)
+        }
+        crate::ai::agent::AIAgentTextSection::Image { image } => {
+            image.markdown_source.contains(needle)
+        }
+        crate::ai::agent::AIAgentTextSection::MermaidDiagram { diagram } => {
+            diagram.markdown_source.contains(needle)
+        }
+    })
 }
 
 // ── IdleTimeoutSender tests ──────────────────────────────────────────────────────

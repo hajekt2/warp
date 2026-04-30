@@ -422,3 +422,143 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
 }
 
 warp_core::register_telemetry_event!(CliTelemetryEvent);
+
+#[derive(Debug, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
+#[allow(dead_code)]
+pub(super) enum AcpTelemetryEvent {
+    InitializeCompleted {
+        agent_id: String,
+        agent_name: Option<String>,
+        agent_version: Option<String>,
+        latency_ms: u128,
+        success: bool,
+        error_kind: Option<String>,
+    },
+    SessionStarted {
+        agent_id: String,
+        mcp_server_count: usize,
+    },
+    PromptCompleted {
+        agent_id: String,
+        latency_ms: u128,
+        stop_reason: String,
+        tool_call_count: usize,
+        agent_message_chunk_count: usize,
+        error_kind: Option<String>,
+    },
+    ClientRequest {
+        agent_id: String,
+        method: String,
+        outcome: String,
+    },
+    TransportError {
+        agent_id: String,
+        kind: String,
+    },
+}
+
+impl TelemetryEvent for AcpTelemetryEvent {
+    fn name(&self) -> &'static str {
+        AcpTelemetryEventDiscriminants::from(self).name()
+    }
+
+    fn payload(&self) -> Option<Value> {
+        match self {
+            Self::InitializeCompleted {
+                agent_id,
+                agent_name,
+                agent_version,
+                latency_ms,
+                success,
+                error_kind,
+            } => Some(json!({
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_version": agent_version,
+                "latency_ms": latency_ms,
+                "success": success,
+                "error_kind": error_kind,
+            })),
+            Self::SessionStarted {
+                agent_id,
+                mcp_server_count,
+            } => Some(json!({
+                "agent_id": agent_id,
+                "mcp_server_count": mcp_server_count,
+            })),
+            Self::PromptCompleted {
+                agent_id,
+                latency_ms,
+                stop_reason,
+                tool_call_count,
+                agent_message_chunk_count,
+                error_kind,
+            } => Some(json!({
+                "agent_id": agent_id,
+                "latency_ms": latency_ms,
+                "stop_reason": stop_reason,
+                "tool_call_count": tool_call_count,
+                "agent_message_chunk_count": agent_message_chunk_count,
+                "error_kind": error_kind,
+            })),
+            Self::ClientRequest {
+                agent_id,
+                method,
+                outcome,
+            } => Some(json!({
+                "agent_id": agent_id,
+                "method": method,
+                "outcome": outcome,
+            })),
+            Self::TransportError { agent_id, kind } => Some(json!({
+                "agent_id": agent_id,
+                "kind": kind,
+            })),
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        AcpTelemetryEventDiscriminants::from(self).description()
+    }
+
+    fn enablement_state(&self) -> EnablementState {
+        AcpTelemetryEventDiscriminants::from(self).enablement_state()
+    }
+
+    fn contains_ugc(&self) -> bool {
+        false
+    }
+
+    fn event_descs() -> impl Iterator<Item = Box<dyn TelemetryEventDesc>> {
+        warp_core::telemetry::enum_events::<Self>()
+    }
+}
+
+impl TelemetryEventDesc for AcpTelemetryEventDiscriminants {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::InitializeCompleted => "ACP.Initialize.Completed",
+            Self::SessionStarted => "ACP.Session.Started",
+            Self::PromptCompleted => "ACP.Prompt.Completed",
+            Self::ClientRequest => "ACP.ClientRequest",
+            Self::TransportError => "ACP.Transport.Error",
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::InitializeCompleted => "ACP initialize completed",
+            Self::SessionStarted => "ACP session started",
+            Self::PromptCompleted => "ACP prompt completed",
+            Self::ClientRequest => "ACP agent-to-client request handled",
+            Self::TransportError => "ACP transport error occurred",
+        }
+    }
+
+    fn enablement_state(&self) -> EnablementState {
+        EnablementState::Flag(FeatureFlag::AcpClient)
+    }
+}
+
+warp_core::register_telemetry_event!(AcpTelemetryEvent);

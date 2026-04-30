@@ -170,6 +170,13 @@ pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverE
     match harness {
         Harness::Oz => Ok(HarnessKind::Oz),
         Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
+        // OpenCode is now reached through the configured ACP registry entry.
+        // Keep the legacy CLI slug as an alias so persisted runs and scripts
+        // that still pass `--harness opencode` route to the ACP path instead
+        // of failing with an unsupported-harness error.
+        Harness::OpenCode if FeatureFlag::AcpClient.is_enabled() => {
+            Ok(HarnessKind::Acp(AcpHarness::new()))
+        }
         Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
         Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
         Harness::Acp if FeatureFlag::AcpClient.is_enabled() => {

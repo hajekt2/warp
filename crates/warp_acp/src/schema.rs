@@ -290,6 +290,242 @@ impl McpServerStdio {
     }
 }
 
+/// ACP `session/update` notification payload.
+///
+/// The upstream protocol is intentionally open-ended: implementations may add new
+/// update kinds without a client upgrade. Warp parses the update discriminator into
+/// known variants and preserves unknown payloads so forward-compatible agents do
+/// not break the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUpdateNotification {
+    pub session_id: SessionId,
+    pub update: SessionUpdate,
+}
+
+/// Typed ACP session update stream item.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionUpdate {
+    AgentMessageChunk {
+        text: String,
+    },
+    AgentThoughtChunk {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: Value,
+    },
+    ToolCallUpdate {
+        id: String,
+        status: Option<String>,
+        args: Option<Value>,
+        output: Option<String>,
+    },
+    Plan {
+        content: String,
+    },
+    CurrentModeUpdate {
+        mode: Value,
+    },
+    AvailableCommandsUpdate {
+        commands: Vec<Value>,
+    },
+    Unknown {
+        method: String,
+        params: Value,
+    },
+}
+
+impl SessionUpdate {
+    #[must_use]
+    pub fn from_notification_params(params: &Value) -> Option<Self> {
+        if let Some(update) = params.get("update") {
+            return serde_json::from_value(update.clone()).ok();
+        }
+        serde_json::from_value(params.clone()).ok()
+    }
+
+    #[must_use]
+    pub fn agent_message_chunk(text: impl Into<String>) -> Self {
+        Self::AgentMessageChunk { text: text.into() }
+    }
+
+    #[must_use]
+    pub fn agent_thought_chunk(text: impl Into<String>) -> Self {
+        Self::AgentThoughtChunk { text: text.into() }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            Self::AgentMessageChunk { .. } => "agent_message_chunk",
+            Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolCallUpdate { .. } => "tool_call_update",
+            Self::Plan { .. } => "plan",
+            Self::CurrentModeUpdate { .. } => "current_mode_update",
+            Self::AvailableCommandsUpdate { .. } => "available_commands_update",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+}
+
+impl Serialize for SessionUpdate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = match self {
+            Self::AgentMessageChunk { text } | Self::AgentThoughtChunk { text } => {
+                serde_json::json!({ "sessionUpdate": self.method(), "text": text })
+            }
+            Self::ToolCall { id, name, args } => serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCall": { "id": id, "name": name, "args": args }
+            }),
+            Self::ToolCallUpdate {
+                id,
+                status,
+                args,
+                output,
+            } => serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": id,
+                "status": status,
+                "args": args,
+                "output": output,
+            }),
+            Self::Plan { content } => {
+                serde_json::json!({ "sessionUpdate": "plan", "content": content })
+            }
+            Self::CurrentModeUpdate { mode } => serde_json::json!({
+                "sessionUpdate": "current_mode_update",
+                "mode": mode,
+            }),
+            Self::AvailableCommandsUpdate { commands } => serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "commands": commands,
+            }),
+            Self::Unknown { method, params } => {
+                let mut value = params.clone();
+                if let Value::Object(map) = &mut value {
+                    map.entry("sessionUpdate".to_string())
+                        .or_insert_with(|| Value::String(method.clone()));
+                }
+                value
+            }
+        };
+        if let Value::Object(map) = &mut value {
+            map.retain(|_, value| !value.is_null());
+        }
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Value::Object(map) = &value else {
+            return Ok(Self::Unknown {
+                method: "<invalid>".to_string(),
+                params: value,
+            });
+        };
+        let raw_method = map
+            .get("sessionUpdate")
+            .or_else(|| map.get("type"))
+            .or_else(|| map.get("kind"))
+            .or_else(|| map.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let normalized = normalize_update_method(raw_method);
+        let text = || extract_text(&value).unwrap_or_default();
+        match normalized.as_str() {
+            "agentmessagechunk" | "agentmessagedelta" | "agentmessage" | "text" => {
+                Ok(Self::AgentMessageChunk { text: text() })
+            }
+            "agentthoughtchunk" | "agentthoughtdelta" | "agentthought" | "thinking" => {
+                Ok(Self::AgentThoughtChunk { text: text() })
+            }
+            "toolcall" => {
+                let tool = map.get("toolCall").unwrap_or(&value);
+                Ok(Self::ToolCall {
+                    id: string_field(tool, &["id", "toolCallId"])
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    name: string_field(tool, &["name", "title", "toolName"])
+                        .unwrap_or_else(|| "tool".to_string()),
+                    args: tool
+                        .get("args")
+                        .or_else(|| tool.get("input"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })
+            }
+            "toolcallupdate" | "toolcallstatus" | "toolcallresult" => Ok(Self::ToolCallUpdate {
+                id: string_field(&value, &["toolCallId", "id"])
+                    .unwrap_or_else(|| "unknown".to_string()),
+                status: string_field(&value, &["status", "state"]),
+                args: map.get("args").or_else(|| map.get("input")).cloned(),
+                output: string_field(&value, &["output", "result", "content", "text"]),
+            }),
+            "plan" => Ok(Self::Plan {
+                content: string_field(&value, &["content", "text", "markdown"]).unwrap_or_default(),
+            }),
+            "currentmodeupdate" | "currentmode" => Ok(Self::CurrentModeUpdate {
+                mode: map.get("mode").cloned().unwrap_or(Value::Null),
+            }),
+            "availablecommandsupdate" | "availablecommands" => Ok(Self::AvailableCommandsUpdate {
+                commands: map
+                    .get("commands")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            _ => Ok(Self::Unknown {
+                method: raw_method.to_string(),
+                params: value,
+            }),
+        }
+    }
+}
+
+fn normalize_update_method(method: &str) -> String {
+    method
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-' && *ch != '/')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn extract_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return Some(text.to_string());
+            }
+            for key in ["content", "delta", "chunk"] {
+                if let Some(text) = map.get(key).and_then(extract_text) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(extract_text),
+        Value::String(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// ACP `session/new` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -791,5 +1027,76 @@ mod tests {
         assert_eq!(value["mcpServers"][0]["command"], "/bin/echo");
         assert_eq!(value["mcpServers"][0]["args"][0], "hello");
         assert_eq!(value["mcpServers"][0]["env"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn session_update_round_trips_known_variants() {
+        let updates = vec![
+            SessionUpdate::AgentMessageChunk {
+                text: "hello".to_string(),
+            },
+            SessionUpdate::AgentThoughtChunk {
+                text: "thinking".to_string(),
+            },
+            SessionUpdate::ToolCall {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path":"README.md"}),
+            },
+            SessionUpdate::ToolCallUpdate {
+                id: "tool-1".to_string(),
+                status: Some("completed".to_string()),
+                args: Some(serde_json::json!({"path":"README.md"})),
+                output: Some("done".to_string()),
+            },
+            SessionUpdate::Plan {
+                content: "1. Test".to_string(),
+            },
+            SessionUpdate::CurrentModeUpdate {
+                mode: serde_json::json!({"id":"build"}),
+            },
+            SessionUpdate::AvailableCommandsUpdate {
+                commands: vec![serde_json::json!({"name":"help"})],
+            },
+        ];
+
+        for update in updates {
+            let value = serde_json::to_value(&update).unwrap();
+            let reparsed: SessionUpdate = serde_json::from_value(value).unwrap();
+            assert_eq!(reparsed, update);
+        }
+    }
+
+    #[test]
+    fn session_update_preserves_unknown_forward_compatible_payload() {
+        let value = serde_json::json!({
+            "sessionUpdate": "future_event",
+            "payload": {"x": 1}
+        });
+
+        let update: SessionUpdate = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(
+            update,
+            SessionUpdate::Unknown {
+                method: "future_event".to_string(),
+                params: value,
+            }
+        );
+    }
+
+    #[test]
+    fn session_update_parses_wrapped_notification_params() {
+        let params = serde_json::json!({
+            "sessionId": "s1",
+            "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}
+        });
+
+        assert_eq!(
+            SessionUpdate::from_notification_params(&params),
+            Some(SessionUpdate::AgentMessageChunk {
+                text: "hello".to_string()
+            })
+        );
     }
 }

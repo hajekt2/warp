@@ -35,7 +35,9 @@ use crate::terminal::cli_agent_sessions::{
 use crate::{
     ai::{
         agent::{
-            AIAgentExchange, AIAgentInput, AIAgentOutput, CancellationReason, RenderableAIError,
+            task::TaskId, AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentExchange,
+            AIAgentInput, AIAgentOutput, AIAgentOutputMessage, AIAgentText, AIAgentTextSection,
+            AgentOutputText, CancellationReason, MessageId, RenderableAIError,
         },
         ambient_agents::{
             conversation_output_status_from_conversation, AmbientAgentTaskId,
@@ -81,9 +83,10 @@ use oneshot::{Canceled, Receiver, Sender};
 use serde_json::Value;
 use uuid::Uuid;
 use warp_acp::{
-    AcpClient, AcpEnvironmentEntry, AcpHttpHeader, AgentMessage, ClientCapabilities, ContentBlock,
-    FileSystemCapabilities, Implementation, InitializeRequest, LocalClientRequestHandler,
-    LocalClientRequestPolicy, McpServer, McpServerSse, McpServerStdio, NewSessionRequest,
+    AcpClient, AcpEnvironmentEntry, AcpHttpHeader, AgentMessage, AuthenticateRequest,
+    ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation, InitializeRequest,
+    LocalClientRequestHandler, LocalClientRequestPolicy, McpServer, McpServerSse, McpServerStdio,
+    NewSessionRequest, SessionUpdate,
 };
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
@@ -292,6 +295,163 @@ pub struct AgentDriver {
     /// when building the runner and taken back to `None` after use so subsequent runs start
     /// fresh.
     resume_payload: Option<ResumePayload>,
+}
+
+#[derive(Default)]
+struct AcpStreamingOutputBuilder {
+    messages: Vec<AIAgentOutputMessage>,
+    agent_text: String,
+    agent_text_message_id: Option<MessageId>,
+    reasoning_text: String,
+    reasoning_message_id: Option<MessageId>,
+    tool_call_message_ids: HashMap<String, MessageId>,
+}
+
+impl AcpStreamingOutputBuilder {
+    fn apply_update(&mut self, update: SessionUpdate) -> bool {
+        match update {
+            SessionUpdate::AgentMessageChunk { text } => {
+                self.agent_text.push_str(&text);
+                self.upsert_agent_text();
+                true
+            }
+            SessionUpdate::AgentThoughtChunk { text } => {
+                self.reasoning_text.push_str(&text);
+                self.upsert_reasoning_text();
+                true
+            }
+            SessionUpdate::ToolCall { id, name, args } => {
+                self.upsert_tool_call(id, name, args);
+                true
+            }
+            SessionUpdate::ToolCallUpdate {
+                id,
+                status,
+                args,
+                output,
+            } => {
+                self.upsert_tool_call_update(id, status, args, output);
+                true
+            }
+            SessionUpdate::Plan { content } => {
+                self.messages.push(AIAgentOutputMessage::text(
+                    MessageId::new(format!("acp-plan-{}", self.messages.len())),
+                    agent_text(format!("## Plan\n\n{content}")),
+                ));
+                true
+            }
+            SessionUpdate::CurrentModeUpdate { .. }
+            | SessionUpdate::AvailableCommandsUpdate { .. }
+            | SessionUpdate::Unknown { .. } => false,
+        }
+    }
+
+    fn output(&self) -> AIAgentOutput {
+        AIAgentOutput {
+            messages: self.messages.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn error_output(message: impl Into<String>) -> AIAgentOutput {
+        AIAgentOutput {
+            messages: vec![AIAgentOutputMessage::debug_output(
+                MessageId::new("acp-error".to_string()),
+                message.into(),
+            )],
+            ..Default::default()
+        }
+    }
+
+    fn upsert_agent_text(&mut self) {
+        let message_id = self
+            .agent_text_message_id
+            .get_or_insert_with(|| MessageId::new("acp-agent-message".to_string()))
+            .clone();
+        self.upsert_message(AIAgentOutputMessage::text(
+            message_id,
+            agent_text(self.agent_text.clone()),
+        ));
+    }
+
+    fn upsert_reasoning_text(&mut self) {
+        let message_id = self
+            .reasoning_message_id
+            .get_or_insert_with(|| MessageId::new("acp-agent-thought".to_string()))
+            .clone();
+        self.upsert_message(AIAgentOutputMessage::reasoning(
+            message_id,
+            agent_text(self.reasoning_text.clone()),
+            None,
+        ));
+    }
+
+    fn upsert_tool_call(&mut self, id: String, name: String, args: Value) {
+        let message_id = self
+            .tool_call_message_ids
+            .entry(id.clone())
+            .or_insert_with(|| MessageId::new(format!("acp-tool-{id}")))
+            .clone();
+        self.upsert_message(AIAgentOutputMessage::action(
+            message_id,
+            AIAgentAction {
+                id: AIAgentActionId::from(id),
+                task_id: TaskId::new("acp".to_string()),
+                action: AIAgentActionType::CallMCPTool {
+                    server_id: None,
+                    name,
+                    input: args,
+                },
+                requires_result: false,
+            },
+        ));
+    }
+
+    fn upsert_tool_call_update(
+        &mut self,
+        id: String,
+        status: Option<String>,
+        args: Option<Value>,
+        output: Option<String>,
+    ) {
+        if !self.tool_call_message_ids.contains_key(&id) {
+            self.upsert_tool_call(id.clone(), "tool".to_string(), args.unwrap_or(Value::Null));
+        }
+
+        let mut lines = Vec::new();
+        if let Some(status) = status {
+            lines.push(format!("Status: {status}"));
+        }
+        if let Some(output) = output {
+            lines.push(format!("Output:\n```\n{output}\n```"));
+        }
+        if !lines.is_empty() {
+            self.messages.push(AIAgentOutputMessage::debug_output(
+                MessageId::new(format!("acp-tool-update-{id}-{}", self.messages.len())),
+                format!("ACP tool `{id}` update\n{}", lines.join("\n\n")),
+            ));
+        }
+    }
+
+    fn upsert_message(&mut self, message: AIAgentOutputMessage) {
+        if let Some(existing) = self
+            .messages
+            .iter_mut()
+            .find(|existing| existing.id == message.id)
+        {
+            *existing = message;
+        } else {
+            self.messages.push(message);
+        }
+    }
+}
+
+fn agent_text(text: String) -> AIAgentText {
+    AIAgentText {
+        sections: vec![AIAgentTextSection::PlainText {
+            text: AgentOutputText::from(text),
+        }],
+    }
 }
 
 pub(crate) enum SDKConversationOutputStatus {
@@ -1537,7 +1697,7 @@ impl AgentDriver {
             .await?
             .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
 
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
         let acp_run = tokio::task::spawn_blocking(move || {
             let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
             let fs_capabilities = match (
@@ -1556,6 +1716,15 @@ impl AgentDriver {
                         .with_terminal(request_policy.allow_terminal),
                 ))
                 .map_err(anyhow::Error::from)?;
+            if let Some(method_id) =
+                Self::preferred_acp_auth_method(&initialize_response.auth_methods)
+            {
+                client
+                    .authenticate(AuthenticateRequest::new(method_id.clone()))
+                    .with_context(|| {
+                        format!("ACP authentication failed for method `{method_id}`")
+                    })?;
+            }
             let mcp_servers = Self::filter_acp_mcp_servers_for_agent_capabilities(
                 mcp_servers,
                 &initialize_response.agent_capabilities,
@@ -1566,37 +1735,27 @@ impl AgentDriver {
             let session_id = session.session_id.clone();
             let mut request_handler =
                 LocalClientRequestHandler::new(request_policy).map_err(|error| anyhow!(error))?;
-            let output = Arc::new(Mutex::new(String::new()));
+            let output = Arc::new(Mutex::new(AcpStreamingOutputBuilder::default()));
             let output_for_notifications = Arc::clone(&output);
-            let output_for_requests = Arc::clone(&output);
-            let request_output_tx = output_tx.clone();
             client
                 .prompt_with_agent_message_and_request_handler(
                     session.session_id,
                     vec![ContentBlock::text(prompt)],
                     move |message| {
-                        if let Some(text) = Self::acp_message_text(&message) {
-                            let mut output = output_for_notifications
+                        if let Some(update) = Self::acp_session_update(&message) {
+                            let mut builder = output_for_notifications
                                 .lock()
-                                .expect("ACP output poisoned");
-                            output.push_str(&text);
-                            let _ = output_tx.send(output.clone());
+                                .expect("ACP output builder poisoned");
+                            if builder.apply_update(update) {
+                                let _ = output_tx.send(builder.output());
+                            }
                         }
                     },
-                    move |message, transport| {
-                        if let Some(summary) = Self::acp_client_request_summary(&message) {
-                            let mut output =
-                                output_for_requests.lock().expect("ACP output poisoned");
-                            output.push_str("\n\n");
-                            output.push_str(&summary);
-                            let _ = request_output_tx.send(output.clone());
-                        }
-                        request_handler.handle(message, transport)
-                    },
+                    move |message, transport| request_handler.handle(message, transport),
                 )
                 .map_err(anyhow::Error::from)?;
             let _ = client.close_session(session_id);
-            let output = output.lock().expect("ACP output poisoned").clone();
+            let output = output.lock().expect("ACP output builder poisoned").output();
             Ok::<_, anyhow::Error>(output)
         });
 
@@ -1609,7 +1768,7 @@ impl AgentDriver {
                         foreground
                             .spawn(move |_, ctx| {
                                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                                    history.update_acp_streaming_exchange(
+                                    history.update_acp_streaming_exchange_output(
                                         terminal_view_id,
                                         &handle,
                                         output,
@@ -1634,7 +1793,7 @@ impl AgentDriver {
             foreground
                 .spawn(move |_, ctx| {
                     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                        history.update_acp_streaming_exchange(
+                        history.update_acp_streaming_exchange_output(
                             terminal_view_id,
                             &handle,
                             output,
@@ -1646,18 +1805,25 @@ impl AgentDriver {
                 .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
         }
 
-        let output_text = if output_text.trim().is_empty() {
-            "ACP agent completed without streamed text output.".to_string()
+        let final_output = if output_text.messages.is_empty() {
+            AcpStreamingOutputBuilder::error_output(
+                "ACP agent completed without streamed text output.",
+            )
         } else {
             output_text
         };
         foreground
             .spawn(move |_, ctx| {
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.finish_acp_streaming_exchange(
+                    history.update_acp_streaming_exchange_output(
                         terminal_view_id,
                         &stream_handle,
-                        output_text,
+                        final_output,
+                        ctx,
+                    )?;
+                    history.finish_acp_streaming_exchange_current_output(
+                        terminal_view_id,
+                        &stream_handle,
                         ctx,
                     )
                 })
@@ -1823,87 +1989,29 @@ impl AgentDriver {
         ))
     }
 
-    fn acp_client_request_summary(message: &AgentMessage) -> Option<String> {
-        let AgentMessage::Request { method, params, .. } = message else {
-            return None;
-        };
-
-        let summary = match method.as_str() {
-            "fs/read_text_file" => format!(
-                "ACP requested file read: `{}`. Routed through Warp's workspace and permission policy.",
-                params
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown path>")
-            ),
-            "fs/write_text_file" => format!(
-                "ACP requested file write: `{}`. Routed through Warp's workspace and diff/write approval policy.",
-                params
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown path>")
-            ),
-            "terminal/create" => format!(
-                "ACP requested terminal command: `{}`. Routed through Warp's command execution approval policy.",
-                params
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown command>")
-            ),
-            "session/request_permission" => {
-                "ACP requested user permission. Routed through Warp's configured approval policy."
-                    .to_string()
-            }
-            method if method.starts_with("terminal/") => format!(
-                "ACP requested `{method}`. Routed through Warp's terminal permission policy."
-            ),
-            _ => return None,
-        };
-
-        Some(format!("_{} _", summary))
+    fn preferred_acp_auth_method(auth_methods: &[Value]) -> Option<String> {
+        auth_methods.iter().find_map(|method| {
+            method
+                .get("methodId")
+                .or_else(|| method.get("id"))
+                .or_else(|| method.get("name"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
     }
 
-    fn acp_message_text(message: &AgentMessage) -> Option<String> {
+    fn acp_session_update(message: &AgentMessage) -> Option<SessionUpdate> {
         let AgentMessage::Notification { method, params } = message else {
             return None;
         };
         if method != "session/update" {
             return None;
         }
-        let mut text = String::new();
-        Self::collect_acp_text(params, &mut text);
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn collect_acp_text(value: &Value, output: &mut String) {
-        match value {
-            Value::Object(map) => {
-                if map.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = map.get("text").and_then(Value::as_str) {
-                        output.push_str(text);
-                        return;
-                    }
-                }
-                // ACP implementations differ slightly in where they put streaming text
-                // (`content`, `delta`, nested update objects). Conservatively scan known
-                // JSON values and only copy string fields named `text`.
-                if let Some(text) = map.get("text").and_then(Value::as_str) {
-                    output.push_str(text);
-                }
-                for (key, nested) in map {
-                    if key == "text" {
-                        continue;
-                    }
-                    Self::collect_acp_text(nested, output);
-                }
-            }
-            Value::Array(values) => {
-                for nested in values {
-                    Self::collect_acp_text(nested, output);
-                }
-            }
-            _ => {}
+        let update = SessionUpdate::from_notification_params(params);
+        if matches!(update, Some(SessionUpdate::Unknown { .. })) {
+            log::debug!("Ignoring unknown ACP session/update payload: {params}");
         }
+        update
     }
 
     /// Sets up the third-party harness by subscribing to CLI session events and
