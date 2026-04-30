@@ -15,6 +15,7 @@
 mod client;
 mod command;
 mod jsonrpc;
+mod local_handler;
 mod registry;
 pub mod schema;
 mod transport;
@@ -22,13 +23,23 @@ mod transport;
 pub use client::{AcpClient, AcpClientError};
 pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
 pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
+pub use local_handler::{LocalClientRequestHandler, LocalClientRequestPolicy};
 pub use registry::{
     codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,
 };
 pub use schema::{
-    conservative_initialize_request, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    Implementation, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionId, StopReason, TextContent,
+    conservative_initialize_request, AcpEnvironmentEntry, AuthenticateRequest,
+    AuthenticateResponse, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PermissionOption, PromptRequest,
+    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse, SessionId,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TerminalExitStatus, TerminalOutputResponse,
+    TerminalRefRequest, TextContent, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 pub use transport::{JsonRpcStdioTransport, JsonRpcTransportError};

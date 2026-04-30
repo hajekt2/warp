@@ -5,16 +5,27 @@ use thiserror::Error;
 
 use crate::command::AcpAgentCommand;
 use crate::schema::{
-    conservative_initialize_request, ContentBlock, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    conservative_initialize_request, AuthenticateRequest, AuthenticateResponse,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionId, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
 };
 use crate::transport::{JsonRpcStdioTransport, JsonRpcTransportError};
 use crate::{AgentMessage, JsonRpcErrorObject};
 
 const INITIALIZE_METHOD: &str = "initialize";
+const AUTHENTICATE_METHOD: &str = "authenticate";
 const SESSION_NEW_METHOD: &str = "session/new";
+const SESSION_LOAD_METHOD: &str = "session/load";
+const SESSION_RESUME_METHOD: &str = "session/resume";
+const SESSION_LIST_METHOD: &str = "session/list";
+const SESSION_CLOSE_METHOD: &str = "session/close";
 const SESSION_PROMPT_METHOD: &str = "session/prompt";
 const SESSION_CANCEL_METHOD: &str = "session/cancel";
+const SESSION_SET_CONFIG_OPTION_METHOD: &str = "session/set_config_option";
+const SESSION_SET_MODE_METHOD: &str = "session/set_mode";
 
 #[derive(Debug, Error)]
 pub enum AcpClientError {
@@ -80,6 +91,59 @@ impl AcpClient {
         Ok(self.transport.request(SESSION_NEW_METHOD, request)?)
     }
 
+    pub fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, AcpClientError> {
+        Ok(self.transport.request(AUTHENTICATE_METHOD, request)?)
+    }
+
+    pub fn load_session(
+        &self,
+        request: LoadSessionRequest,
+    ) -> Result<LoadSessionResponse, AcpClientError> {
+        Ok(self.transport.request(SESSION_LOAD_METHOD, request)?)
+    }
+
+    pub fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, AcpClientError> {
+        Ok(self.transport.request(SESSION_RESUME_METHOD, request)?)
+    }
+
+    pub fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, AcpClientError> {
+        Ok(self.transport.request(SESSION_LIST_METHOD, request)?)
+    }
+
+    pub fn close_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CloseSessionResponse, AcpClientError> {
+        Ok(self
+            .transport
+            .request(SESSION_CLOSE_METHOD, CloseSessionRequest::new(session_id))?)
+    }
+
+    pub fn set_session_mode(
+        &self,
+        request: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, AcpClientError> {
+        Ok(self.transport.request(SESSION_SET_MODE_METHOD, request)?)
+    }
+
+    pub fn set_session_config_option(
+        &self,
+        request: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, AcpClientError> {
+        Ok(self
+            .transport
+            .request(SESSION_SET_CONFIG_OPTION_METHOD, request)?)
+    }
+
     pub fn prompt(
         &self,
         session_id: SessionId,
@@ -109,10 +173,29 @@ impl AcpClient {
         &self,
         session_id: SessionId,
         prompt: Vec<ContentBlock>,
-        mut handle_message: F,
+        handle_message: F,
     ) -> Result<PromptResponse, AcpClientError>
     where
         F: FnMut(AgentMessage),
+    {
+        self.prompt_with_agent_message_and_request_handler(
+            session_id,
+            prompt,
+            handle_message,
+            deny_unsupported_agent_request,
+        )
+    }
+
+    pub fn prompt_with_agent_message_and_request_handler<F, G>(
+        &self,
+        session_id: SessionId,
+        prompt: Vec<ContentBlock>,
+        mut handle_message: F,
+        mut handle_request: G,
+    ) -> Result<PromptResponse, AcpClientError>
+    where
+        F: FnMut(AgentMessage),
+        G: FnMut(AgentMessage, &JsonRpcStdioTransport) -> Result<(), JsonRpcTransportError>,
     {
         Ok(self.transport.request_timeout_with_handler(
             SESSION_PROMPT_METHOD,
@@ -123,7 +206,7 @@ impl AcpClient {
                     handle_message(message);
                     Ok(())
                 }
-                AgentMessage::Request { .. } => deny_unsupported_agent_request(message, transport),
+                AgentMessage::Request { .. } => handle_request(message, transport),
             },
         )?)
     }
@@ -206,7 +289,7 @@ fn deny_unsupported_agent_request(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;
@@ -284,6 +367,77 @@ mod tests {
         assert!(written.contains("session/cancel"));
         assert!(written.contains("s1"));
         assert!(!written.contains("\"id\""));
+    }
+
+    #[test]
+    fn sends_session_lifecycle_requests() {
+        struct StaticThenBlock(Cursor<Vec<u8>>);
+
+        impl Read for StaticThenBlock {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                if n == 0 {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+                Ok(n)
+            }
+        }
+
+        fn client_with_response(response: &'static [u8]) -> (AcpClient, Arc<Mutex<Vec<u8>>>) {
+            let writer = SharedWriter::default();
+            let captured = Arc::clone(&writer.0);
+            (
+                AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
+                    StaticThenBlock(Cursor::new(response.to_vec())),
+                    writer,
+                    None,
+                )),
+                captured,
+            )
+        }
+
+        let (client, captured) = client_with_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"sessions":[{"sessionId":"s1"}]}}
+"#,
+        );
+        let listed = client
+            .list_sessions(ListSessionsRequest::default())
+            .unwrap();
+        assert_eq!(listed.sessions[0].session_id, SessionId::new("s1"));
+        assert!(String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("session/list"));
+
+        let (client, captured) = client_with_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}
+"#,
+        );
+        let _loaded = client
+            .load_session(LoadSessionRequest::new("s1", "/tmp"))
+            .unwrap();
+        assert!(String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("session/load"));
+
+        let (client, captured) = client_with_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}
+"#,
+        );
+        let _resumed = client
+            .resume_session(ResumeSessionRequest::new("s1", "/tmp"))
+            .unwrap();
+        assert!(String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("session/resume"));
+
+        let (client, captured) = client_with_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}
+"#,
+        );
+        let _closed = client.close_session(SessionId::new("s1")).unwrap();
+        assert!(String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("session/close"));
     }
 
     #[test]

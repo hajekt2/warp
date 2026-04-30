@@ -16,7 +16,7 @@ V1 client flow:
 
 `initialize { protocolVersion, clientCapabilities, clientInfo }` → `InitializeResponse` → optional auth follow-up → `session/new` → `session/prompt` with `session/update` notifications → `PromptResponse`.
 
-Warp initially advertises conservative capabilities. `fs`, `terminal`, and MCP forwarding should remain disabled unless the corresponding approval bridge is fully wired.
+Warp advertises capabilities from a per-run snapshot of the active Agent Mode autonomy profile. File reads/writes stay workspace-contained, writes require `apply_code_diffs = AlwaysAllow`, terminal execution requires `execute_commands = AlwaysAllow`, and permission requests only auto-select when an existing profile already grants the corresponding capability.
 
 ## Security Boundary
 
@@ -24,7 +24,7 @@ Warp initially advertises conservative capabilities. `fs`, `terminal`, and MCP f
 - Resolve command paths before launch and report missing executables with registry install URLs when available.
 - Do not sync executable command/args/env in a way that silently executes on another device; require local confirmation.
 - MCP forwarding is per-agent/per-server opt-in, with env/secret redaction in logs, snapshots, and error UI.
-- `fs/write_text_file`, `terminal/create`, and `session/request_permission` return only after Warp approval or rejection.
+- `fs/write_text_file`, `terminal/create`, and `session/request_permission` return only after Warp applies the active approval policy; disallowed requests return JSON-RPC errors or a cancellation-shaped permission response.
 
 ## Current Implementation Notes
 
@@ -34,7 +34,7 @@ Warp initially advertises conservative capabilities. `fs`, `terminal`, and MCP f
 
 ## Rollout
 
-ACP client support is compile-gated by `acp_client` and runtime-gated by `FeatureFlag::AcpClient`. Dogfood builds enable the runtime flag first; Preview/Stable promotion remains a follow-up after authenticated OpenCode/Codex prompt-turn validation.
+ACP client support remains guarded by `FeatureFlag::AcpClient`, but `acp_client` is included in the default Cargo feature set for Stable rollout. The flag is intentionally retained for 1–2 release cycles as a rollback lever.
 
 ## Verification
 
@@ -42,4 +42,4 @@ ACP client support is compile-gated by `acp_client` and runtime-gated by `Featur
 - Settings tests for serialization, feature gating, and local-only ACP config storage.
 - UI model/selector tests for built-in and configured ACP entries.
 - Integration fixture binary for ACP initialize/session/new/session/prompt echo.
-- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, MCP allowlist with redaction.
+- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, MCP allowlist with redaction, fs read/write bridge, terminal lifecycle bridge, and session list/load/resume/close protocol calls.

@@ -578,6 +578,7 @@ default = [
     "sync_ambient_plans",
     "conversation_artifacts",
     "agent_view",
+    "acp_client",
     "agent_view_block_context",
     "agent_view_conversation_list_view",
     "inline_slash_commands",

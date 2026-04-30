@@ -295,6 +295,19 @@ impl JsonRpcStdioTransport {
     }
 }
 
+impl Drop for JsonRpcStdioTransport {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(child) = child.as_mut() {
+                if matches!(child.try_wait(), Ok(None)) {
+                    let _ = child.kill();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};

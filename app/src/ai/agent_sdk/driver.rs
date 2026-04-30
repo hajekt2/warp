@@ -79,7 +79,11 @@ use futures::{
 use oneshot::{Canceled, Receiver, Sender};
 use serde_json::Value;
 use uuid::Uuid;
-use warp_acp::{AcpClient, AgentMessage, ContentBlock, NewSessionRequest};
+use warp_acp::{
+    AcpClient, AgentMessage, ClientCapabilities, ContentBlock, FileSystemCapabilities,
+    Implementation, InitializeRequest, LocalClientRequestHandler, LocalClientRequestPolicy,
+    McpServer, McpServerStdio, NewSessionRequest,
+};
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
 use warp_cli::share::ShareRequest;
@@ -1440,7 +1444,7 @@ impl AgentDriver {
         foreground: &ModelSpawner<Self>,
     ) -> Result<(), AgentDriverError> {
         let selected_agent_id = harness.agent_id().cloned();
-        let (terminal_view_id, working_dir, config, server_api) = foreground
+        let (terminal_view_id, working_dir, config, server_api, request_policy) = foreground
             .spawn(move |me, ctx| {
                 let settings = AISettings::as_ref(ctx);
                 let config = match selected_agent_id.as_ref() {
@@ -1459,11 +1463,28 @@ impl AgentDriver {
                             reason: "No ACP agents are configured in AI settings.".to_string(),
                         })?,
                 };
+                let terminal_view_id = me.terminal_driver.as_ref(ctx).terminal_view().id();
+                let permissions = BlocklistAIPermissions::as_ref(ctx);
+                let read_files_setting =
+                    permissions.get_read_files_setting(ctx, Some(terminal_view_id));
+                let apply_diffs_setting =
+                    permissions.get_apply_code_diffs_setting(ctx, Some(terminal_view_id));
+                let execute_commands_setting =
+                    permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
+                let request_policy = LocalClientRequestPolicy {
+                    workspace_root: me.working_dir.clone(),
+                    allow_read_text_file: !read_files_setting.is_always_ask(),
+                    allow_write_text_file: apply_diffs_setting.is_always_allow(),
+                    allow_terminal: execute_commands_setting.is_always_allow(),
+                    allow_permission_selection: apply_diffs_setting.is_always_allow()
+                        || execute_commands_setting.is_always_allow(),
+                };
                 Ok::<_, AgentDriverError>((
-                    me.terminal_driver.as_ref(ctx).terminal_view().id(),
+                    terminal_view_id,
                     me.working_dir.clone(),
                     config,
                     ServerApiProvider::as_ref(ctx).get_harness_support_client(),
+                    request_policy,
                 ))
             })
             .await??;
@@ -1491,6 +1512,7 @@ impl AgentDriver {
         };
 
         harness::validate_cli_installed(&config.command, config.install_url.as_deref())?;
+        let mcp_servers = Self::acp_mcp_servers_from_allowlist(&config.mcp_allowlist);
         let command = config
             .to_launch_command()
             .map_err(AgentDriverError::ConfigBuildFailed)?;
@@ -1499,14 +1521,32 @@ impl AgentDriver {
         let working_dir_for_history = working_dir.clone();
         let output_text = tokio::task::spawn_blocking(move || {
             let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
-            client.initialize("Warp").map_err(anyhow::Error::from)?;
-            let session = client
-                .new_session(NewSessionRequest::new(working_dir))
+            let fs_capabilities = match (
+                request_policy.allow_read_text_file,
+                request_policy.allow_write_text_file,
+            ) {
+                (true, true) => FileSystemCapabilities::read_write(),
+                (true, false) => FileSystemCapabilities::read_only(),
+                _ => FileSystemCapabilities::none(),
+            };
+            client
+                .initialize_with(InitializeRequest::new(
+                    Some(Implementation::new("Warp").with_version(env!("CARGO_PKG_VERSION"))),
+                    ClientCapabilities::conservative()
+                        .with_file_system(fs_capabilities)
+                        .with_terminal(request_policy.allow_terminal),
+                ))
                 .map_err(anyhow::Error::from)?;
+            let session = client
+                .new_session(NewSessionRequest::new(working_dir).with_mcp_servers(mcp_servers))
+                .map_err(anyhow::Error::from)?;
+            let session_id = session.session_id.clone();
+            let mut request_handler =
+                LocalClientRequestHandler::new(request_policy).map_err(|error| anyhow!(error))?;
             let output = Arc::new(Mutex::new(String::new()));
             let output_for_handler = Arc::clone(&output);
             client
-                .prompt_with_agent_message_handler(
+                .prompt_with_agent_message_and_request_handler(
                     session.session_id,
                     vec![ContentBlock::text(prompt)],
                     move |message| {
@@ -1516,8 +1556,10 @@ impl AgentDriver {
                             output.push_str(&text);
                         }
                     },
+                    move |message, transport| request_handler.handle(message, transport),
                 )
                 .map_err(anyhow::Error::from)?;
+            let _ = client.close_session(session_id);
             let output = output.lock().expect("ACP output poisoned").clone();
             Ok::<_, anyhow::Error>(output)
         })
@@ -1545,6 +1587,30 @@ impl AgentDriver {
             .await?
             .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
         Ok(())
+    }
+
+    fn acp_mcp_servers_from_allowlist(allowlist: &[String]) -> Vec<McpServer> {
+        allowlist
+            .iter()
+            .filter_map(|entry| Self::parse_acp_mcp_server(entry))
+            .collect()
+    }
+
+    fn parse_acp_mcp_server(entry: &str) -> Option<McpServer> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        let (name, argv) = entry
+            .split_once('|')
+            .or_else(|| entry.split_once('='))
+            .map(|(name, argv)| (name.trim().to_string(), argv.trim().to_string()))
+            .unwrap_or_else(|| (entry.to_string(), entry.to_string()));
+        let argv = shell_words::split(&argv).ok()?;
+        let (command, args) = argv.split_first()?;
+        Some(McpServer::Stdio(
+            McpServerStdio::new(name, command).args(args.iter().cloned()),
+        ))
     }
 
     fn acp_message_text(message: &AgentMessage) -> Option<String> {
