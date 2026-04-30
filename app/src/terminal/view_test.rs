@@ -585,12 +585,24 @@ fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
             );
         });
         terminal.read(&app, |view, ctx| {
+            let ambient_agent_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model");
             assert!(
-                view.ambient_agent_view_model()
-                    .expect("cloud mode terminal should have ambient model")
-                    .as_ref(ctx)
-                    .is_agent_running(),
+                ambient_agent_model.as_ref(ctx).is_agent_running(),
                 "Enter should dispatch the configured ACP agent locally instead of starting a cloud environment"
+            );
+            assert!(
+                ambient_agent_model.as_ref(ctx).harness_command_started(),
+                "local ACP should be treated as a started local harness immediately"
+            );
+            assert!(
+                !ambient_agent::is_cloud_agent_pre_first_exchange(
+                    view.ambient_agent_view_model(),
+                    view.agent_view_controller(),
+                    ctx,
+                ),
+                "local ACP should not show the Oz/cloud startup placeholder while waiting for a shared session"
             );
         });
     });

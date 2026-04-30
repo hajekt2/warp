@@ -316,7 +316,7 @@ impl AmbientAgentViewModel {
     }
 
     /// Whether the harness CLI has started running. Only meaningful for non-oz runs.
-    pub(super) fn harness_command_started(&self) -> bool {
+    pub(crate) fn harness_command_started(&self) -> bool {
         self.harness_command_started
     }
 
@@ -586,8 +586,10 @@ impl AmbientAgentViewModel {
         let mcp_servers = AgentDriver::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
         let foreground = ctx.spawner();
 
+        self.harness_command_started = true;
         self.status = Status::AgentRunning;
         ctx.emit(AmbientAgentViewModelEvent::DispatchedAgent);
+        ctx.emit(AmbientAgentViewModelEvent::HarnessCommandStarted);
 
         ctx.spawn(
             async move {
