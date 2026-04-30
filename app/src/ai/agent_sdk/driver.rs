@@ -1993,14 +1993,36 @@ impl AgentDriver {
     }
 
     pub(crate) fn preferred_acp_auth_method(auth_methods: &[Value]) -> Option<String> {
-        auth_methods.iter().find_map(|method| {
-            method
-                .get("methodId")
-                .or_else(|| method.get("id"))
-                .or_else(|| method.get("name"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
+        auth_methods
+            .iter()
+            .filter(|method| !Self::is_interactive_acp_auth_method(method))
+            .find_map(Self::acp_auth_method_id)
+    }
+
+    fn is_interactive_acp_auth_method(method: &Value) -> bool {
+        let searchable = ["methodId", "id", "name", "description"]
+            .into_iter()
+            .filter_map(|key| method.get(key).and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+
+        // Some ACP agents, including OpenCode, advertise a login method as setup
+        // guidance but do not implement the JSON-RPC `authenticate` request for it.
+        // Do not automatically call interactive login methods from the prompt path;
+        // let the session proceed and surface any real auth failure from the agent.
+        searchable.contains("login")
+            || searchable.contains("browser")
+            || searchable.contains("terminal")
+    }
+
+    pub(crate) fn acp_auth_method_id(method: &Value) -> Option<String> {
+        method
+            .get("methodId")
+            .or_else(|| method.get("id"))
+            .or_else(|| method.get("name"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
     }
 
     pub(crate) fn acp_session_update(message: &AgentMessage) -> Option<SessionUpdate> {

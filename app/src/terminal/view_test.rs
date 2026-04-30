@@ -1,8 +1,10 @@
 use std::any::Any;
 use std::cell::RefCell;
+use std::fs;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai::agent::conversation::ConversationStatus;
 use parking_lot::FairMutex;
@@ -605,6 +607,96 @@ fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
                 "local ACP should not show the Oz/cloud startup placeholder while waiting for a shared session"
             );
         });
+    });
+}
+
+#[test]
+fn enter_runs_configured_acp_agent_without_calling_interactive_auth() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-login-agent-{}-{}.sh",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"login-fixture","version":"test"},"authMethods":[{"id":"opencode-login","name":"Login with opencode","description":"Run `opencode auth login` in the terminal"}]}}'
+IFS= read -r line || exit 1
+case "$line" in
+  *'"method":"authenticate"'*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"authenticate should not be called for interactive login methods"}}'
+    exit 0
+    ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"login-fixture-session"}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"login-fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"echo: test"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+IFS= read -r line || exit 0
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
+"#,
+        )
+        .expect("write ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Login ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("login-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                BlocklistAIHistoryModel::as_ref(ctx)
+                    .active_conversation(view.view_id)
+                    .and_then(|conversation| conversation.latest_exchange())
+                    .map(|exchange| exchange.format_output_for_copy(None).contains("echo: test"))
+                    .unwrap_or(false)
+            }),
+            "configured ACP login fixture should stream output instead of calling authenticate"
+        );
+
+        let _ = fs::remove_file(script_path);
     });
 }
 

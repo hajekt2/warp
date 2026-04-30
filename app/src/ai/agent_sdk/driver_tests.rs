@@ -162,6 +162,30 @@ fn acp_auth_method_prefers_method_id() {
 }
 
 #[test]
+fn acp_auth_method_skips_interactive_login_methods() {
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[
+            serde_json::json!({
+                "id": "opencode-login",
+                "name": "Login with opencode",
+                "description": "Run `opencode auth login` in the terminal"
+            }),
+            serde_json::json!({"methodId":"env-openai-api-key"}),
+        ]),
+        Some("env-openai-api-key".to_string())
+    );
+
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[serde_json::json!({
+            "id": "opencode-login",
+            "name": "Login with opencode",
+            "description": "Run `opencode auth login` in the terminal"
+        })]),
+        None
+    );
+}
+
+#[test]
 fn acp_streaming_output_builder_maps_structured_updates_to_warp_messages() {
     let mut builder = AcpStreamingOutputBuilder::default();
 

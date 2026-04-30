@@ -567,6 +567,7 @@ impl AmbientAgentViewModel {
                 return;
             }
         };
+        let command_argv = command.display_argv();
 
         let permissions = BlocklistAIPermissions::as_ref(ctx);
         let terminal_view_id = self.terminal_view_id;
@@ -593,6 +594,11 @@ impl AmbientAgentViewModel {
 
         ctx.spawn(
             async move {
+                log::info!(
+                    "Starting local ACP agent '{}' with argv {:?}",
+                    agent_id.as_str(),
+                    command_argv
+                );
                 let prompt_for_history = prompt.clone();
                 let working_dir_for_history = working_dir.clone();
                 let stream_handle = foreground
@@ -676,6 +682,7 @@ impl AmbientAgentViewModel {
                 });
 
                 tokio::pin!(acp_run);
+                let mut run_error = None;
                 let output_text = loop {
                     tokio::select! {
                         maybe_output = output_rx.recv() => {
@@ -700,8 +707,15 @@ impl AmbientAgentViewModel {
                             break result
                                 .map_err(|error| anyhow!(error))?
                                 .unwrap_or_else(|error| {
+                                    let error_text = format!("{error:#}");
+                                    log::error!(
+                                        "Local ACP agent '{}' failed: {}",
+                                        agent_id.as_str(),
+                                        error_text
+                                    );
+                                    run_error = Some(anyhow!(error_text.clone()));
                                     AcpStreamingOutputBuilder::error_output(format!(
-                                        "ACP agent failed: {error:#}"
+                                        "ACP agent failed: {error_text}"
                                     ))
                                 });
                         }
@@ -750,6 +764,9 @@ impl AmbientAgentViewModel {
                     })
                     .await?
                     .map_err(|error| anyhow!(error))?;
+                if let Some(error) = run_error {
+                    return Err(error);
+                }
                 Ok::<_, anyhow::Error>(())
             },
             |me, result, ctx| {
