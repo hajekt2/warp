@@ -317,3 +317,46 @@ impl View for HarnessSelector {
         stack.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::ai::AcpAgentLocalConfirmation;
+    use warpui::color::ColorU;
+
+    fn configured_acp_agent(id: &str, name: &str) -> AcpAgentConfig {
+        AcpAgentConfig {
+            id: AcpAgentId::new(id),
+            name: name.to_string(),
+            command: "opencode".to_string(),
+            args: vec!["acp".to_string(), "--port".to_string(), "0".to_string()],
+            env: vec![],
+            mcp_allowlist: vec![],
+            install_url: None,
+            registry_key: None,
+            local_confirmation: AcpAgentLocalConfirmation::default(),
+        }
+    }
+
+    #[test]
+    fn menu_items_include_configured_acp_agents() {
+        let configured_agents = vec![configured_acp_agent("opencode", "OpenCode ACP")];
+        let items = build_menu_items(
+            Fill::black(),
+            ColorU::from_u32(0x000000ff),
+            &configured_agents,
+        );
+
+        assert!(items.iter().any(|item| match item {
+            MenuItem::Item(fields) => {
+                fields.label() == "OpenCode ACP"
+                    && matches!(
+                        fields.on_select_action(),
+                        Some(HarnessSelectorAction::SelectAcpAgent(id))
+                            if id == &AcpAgentId::new("opencode")
+                    )
+            }
+            _ => false,
+        }));
+    }
+}
