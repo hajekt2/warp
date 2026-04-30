@@ -24979,6 +24979,17 @@ impl TypedActionView for TerminalView {
                         });
                     }
                     self.tag_in_agent_for_user_long_running_command(ctx);
+                } else if FeatureFlag::AgentView.is_enabled()
+                    && AISettings::as_ref(ctx).is_local_agent_entrypoint_enabled(ctx)
+                    && !(self.is_ambient_agent_session(ctx) && !self.is_nested_cloud_mode(ctx))
+                {
+                    self.enter_agent_view_for_new_conversation(
+                        None,
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        },
+                        ctx,
+                    );
                 } else {
                     self.input.update(ctx, |input, ctx| {
                         input.set_input_mode_agent(false, ctx);

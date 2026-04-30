@@ -519,6 +519,27 @@ fn root_cloud_mode_pane_sets_root_cloud_mode_context_key() {
 }
 
 #[test]
+fn set_input_mode_agent_enters_agent_view_when_local_acp_is_configured() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(!view.agent_view_controller().as_ref(ctx).is_active());
+            view.handle_action(&TerminalAction::SetInputModeAgent, ctx);
+            assert!(view.agent_view_controller().as_ref(ctx).is_active());
+        });
+    });
+}
+
+#[test]
 fn set_input_mode_agent_does_not_enter_local_agent_from_root_cloud_mode_pane() {
     use crate::terminal::shared_session::SharedSessionStatus;
 
