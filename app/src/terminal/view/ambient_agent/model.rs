@@ -746,6 +746,7 @@ impl AmbientAgentViewModel {
                 } else {
                     output_text
                 };
+                let conversation_id = stream_handle.conversation_id;
                 foreground
                     .spawn(move |_, ctx| {
                         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
@@ -767,11 +768,19 @@ impl AmbientAgentViewModel {
                 if let Some(error) = run_error {
                     return Err(error);
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(conversation_id)
             },
             |me, result, ctx| {
-                if let Err(error) = result {
-                    me.handle_spawn_error(format!("ACP agent failed: {error:#}"), ctx);
+                match result {
+                    Ok(conversation_id) => {
+                        me.status = Status::Composing;
+                        ctx.emit(AmbientAgentViewModelEvent::LocalAcpConversationReady {
+                            conversation_id,
+                        });
+                    }
+                    Err(error) => {
+                        me.handle_spawn_error(format!("ACP agent failed: {error:#}"), ctx);
+                    }
                 }
             },
         );
@@ -1270,6 +1279,10 @@ pub enum AmbientAgentViewModelEvent {
     /// Fires once per run and signals the transition out of the pre-first-exchange phase
     /// for claude / gemini / other third-party harnesses.
     HarnessCommandStarted,
+    /// A local ACP run completed in the local agent history and should be shown in agent view.
+    LocalAcpConversationReady {
+        conversation_id: AIConversationId,
+    },
 
     UpdatedSetupCommandVisibility,
 }

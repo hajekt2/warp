@@ -299,6 +299,15 @@ impl TerminalView {
                 self.force_report_viewer_terminal_size(ctx);
                 ctx.notify();
             }
+            AmbientAgentViewModelEvent::LocalAcpConversationReady { conversation_id } => {
+                self.enter_agent_view_for_conversation(
+                    None,
+                    AgentViewEntryOrigin::CloudAgent,
+                    *conversation_id,
+                    ctx,
+                );
+                ctx.notify();
+            }
             AmbientAgentViewModelEvent::UpdatedSetupCommandVisibility => (),
         }
     }

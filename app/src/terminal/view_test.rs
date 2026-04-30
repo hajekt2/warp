@@ -687,16 +687,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 
         assert_eventually!(
             terminal.read(&app, |view, ctx| {
-                BlocklistAIHistoryModel::as_ref(ctx)
+                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
                     .active_conversation(view.view_id)
-                    .and_then(|conversation| conversation.latest_exchange())
-                    .map(|exchange| {
-                        exchange.output_status.is_finished_and_successful()
-                            && exchange.format_output_for_copy(None).contains("echo: test")
-                    })
-                    .unwrap_or(false)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && exchange.output_status.is_finished_and_successful()
+                    && exchange.format_output_for_copy(None).contains("echo: test")
             }),
-            "configured ACP login fixture should finish the submit loop and stream output instead of calling authenticate"
+            "configured ACP login fixture should finish the submit loop, select the completed conversation, and stream output instead of calling authenticate"
         );
 
         let _ = fs::remove_file(script_path);
