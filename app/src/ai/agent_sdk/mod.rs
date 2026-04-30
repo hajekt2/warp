@@ -259,7 +259,7 @@ fn run_agent(
             if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
             }
-            if args.harness == Harness::OpenCode {
+            if args.harness == Harness::OpenCode && !FeatureFlag::AcpClient.is_enabled() {
                 return Err(anyhow::anyhow!(
                     "The opencode harness is only supported for local child agent launches."
                 ));
@@ -548,19 +548,23 @@ impl AgentDriverRunner {
         server_api: Arc<dyn AIClient>,
         output_format: OutputFormat,
     ) -> Result<(), AgentDriverError> {
-        // Ensure we've synced team state before starting the driver.
-        Self::refresh_team_metadata(&foreground).await?;
+        let is_login_optional_local_acp_run = is_login_optional_local_acp_run(&args);
 
-        // Wait for Warp Drive to sync before building the task config, since
-        // prompt resolution (SavedPrompt -> workflow lookup) and environment
-        // resolution (CloudAmbientAgentEnvironment lookup) depend on it.
-        if foreground
-            .spawn(|_, ctx| common::refresh_warp_drive(ctx))
-            .await?
-            .await
-            .is_err()
-        {
-            return Err(AgentDriverError::WarpDriveSyncFailed);
+        if !is_login_optional_local_acp_run {
+            // Ensure we've synced team state before starting the driver.
+            Self::refresh_team_metadata(&foreground).await?;
+
+            // Wait for Warp Drive to sync before building the task config, since
+            // prompt resolution (SavedPrompt -> workflow lookup) and environment
+            // resolution (CloudAmbientAgentEnvironment lookup) depend on it.
+            if foreground
+                .spawn(|_, ctx| common::refresh_warp_drive(ctx))
+                .await?
+                .await
+                .is_err()
+            {
+                return Err(AgentDriverError::WarpDriveSyncFailed);
+            }
         }
 
         // Extract the task ID if available, so that if there are setup errors and we have
@@ -764,6 +768,8 @@ impl AgentDriverRunner {
         args: RunAgentArgs,
         server_api: &Arc<dyn AIClient>,
     ) -> Result<(AgentDriverOptions, Task, Option<String>), AgentDriverError> {
+        let is_login_optional_local_acp_run = is_login_optional_local_acp_run(&args);
+
         // Get the working directory
         let working_dir = match args.cwd.as_ref() {
             Some(dir) => dunce::canonicalize(dir)
@@ -832,26 +838,28 @@ impl AgentDriverRunner {
             )
             .await?
         } else {
-            // Extract the prompt text that we'll pass up to the server when we create the task.
-            let prompt_for_task_creation = match &prompt {
-                Some(Prompt::PlainText(text)) => text.clone(),
-                Some(Prompt::SavedPrompt(id)) => format!("Saved prompt ({id})"),
-                None => skill
-                    .as_ref()
-                    .map(|s| format!("/{}", s.skill_identifier))
-                    // If we get to this point and we don't have a prompt, saved prompt, or skill,
-                    // error. `clap` should have handled this when parsing args already.
-                    .ok_or(AgentDriverError::InvalidRuntimeState)?,
-            };
+            if !is_login_optional_local_acp_run {
+                // Extract the prompt text that we'll pass up to the server when we create the task.
+                let prompt_for_task_creation = match &prompt {
+                    Some(Prompt::PlainText(text)) => text.clone(),
+                    Some(Prompt::SavedPrompt(id)) => format!("Saved prompt ({id})"),
+                    None => skill
+                        .as_ref()
+                        .map(|s| format!("/{}", s.skill_identifier))
+                        // If we get to this point and we don't have a prompt, saved prompt, or skill,
+                        // error. `clap` should have handled this when parsing args already.
+                        .ok_or(AgentDriverError::InvalidRuntimeState)?,
+                };
 
-            Self::initialize_new_task(
-                foreground,
-                server_api,
-                prompt_for_task_creation,
-                merged_config,
-                &mut driver_options,
-            )
-            .await?;
+                Self::initialize_new_task(
+                    foreground,
+                    server_api,
+                    prompt_for_task_creation,
+                    merged_config,
+                    &mut driver_options,
+                )
+                .await?;
+            }
             None
         };
 
@@ -1257,11 +1265,25 @@ impl AgentDriverRunner {
     }
 }
 
+/// Returns `true` when an ACP run is fully local and can use a user-configured
+/// ACP agent without a Warp account. Server-backed affordances (saved prompts,
+/// cloud conversations/tasks, environments, sharing, and managed cloud
+/// credentials) still require Warp auth because they need Warp APIs.
+fn is_login_optional_local_acp_run(args: &RunAgentArgs) -> bool {
+    matches!(args.harness, Harness::Acp | Harness::OpenCode)
+        && args.prompt_arg.saved_prompt.is_none()
+        && args.task_id.is_none()
+        && args.conversation.is_none()
+        && args.environment.is_none()
+        && !args.share.is_shared()
+        && args.bedrock_inference_role.is_none()
+}
+
 /// Returns `true` if the given CLI command requires authentication.
 fn command_requires_auth(command: &CliCommand) -> bool {
     match command {
         CliCommand::Agent(agent_cmd) => match agent_cmd {
-            AgentCommand::Run { .. } => true,
+            AgentCommand::Run(args) => !is_login_optional_local_acp_run(args),
             AgentCommand::RunCloud { .. } => true,
             AgentCommand::Profile(sub) => match sub {
                 AgentProfileCommand::List => true,

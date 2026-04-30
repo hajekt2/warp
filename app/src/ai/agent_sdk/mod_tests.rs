@@ -1,12 +1,48 @@
 use serde_json::json;
 use warp_cli::{
+    agent::{Harness, HiddenComputerUseArgs, PromptArg, RunAgentArgs, SnapshotArgs},
     artifact::{ArtifactCommand, DownloadArtifactArgs, GetArtifactArgs, UploadArtifactArgs},
+    config_file::ConfigFileArgs,
+    model::ModelArgs,
+    share::ShareArgs,
     task::{MessageCommand, MessageSendArgs, MessageWatchArgs, TaskCommand},
     CliCommand,
 };
 use warp_core::telemetry::TelemetryEvent;
 
 use super::{command_requires_auth, command_to_telemetry_event};
+
+fn run_agent_args_for_harness(harness: Harness) -> RunAgentArgs {
+    RunAgentArgs {
+        prompt_arg: PromptArg {
+            prompt: Some("hello".to_string()),
+            saved_prompt: None,
+        },
+        model: ModelArgs::default(),
+        config_file: ConfigFileArgs::default(),
+        skill: None,
+        name: None,
+        cwd: None,
+        gui: false,
+        share: ShareArgs { share: None },
+        mcp_specs: Vec::new(),
+        mcp_servers: Vec::new(),
+        environment: None,
+        idle_on_complete: None,
+        snapshot: SnapshotArgs {
+            no_snapshot: false,
+            snapshot_upload_timeout: None,
+            snapshot_script_timeout: None,
+        },
+        task_id: None,
+        sandboxed: false,
+        bedrock_inference_role: None,
+        computer_use: HiddenComputerUseArgs::default(),
+        conversation: None,
+        profile: None,
+        harness,
+    }
+}
 
 #[test]
 fn logout_does_not_require_auth() {
@@ -16,6 +52,48 @@ fn logout_does_not_require_auth() {
 #[test]
 fn login_does_not_require_auth() {
     assert!(!command_requires_auth(&CliCommand::Login));
+}
+
+#[test]
+fn local_acp_agent_run_does_not_require_auth() {
+    assert!(!command_requires_auth(&CliCommand::Agent(
+        warp_cli::agent::AgentCommand::Run(run_agent_args_for_harness(Harness::Acp)),
+    )));
+}
+
+#[test]
+fn oz_agent_run_still_requires_auth() {
+    assert!(command_requires_auth(&CliCommand::Agent(
+        warp_cli::agent::AgentCommand::Run(run_agent_args_for_harness(Harness::Oz)),
+    )));
+}
+
+#[test]
+fn legacy_opencode_agent_run_does_not_require_auth() {
+    assert!(!command_requires_auth(&CliCommand::Agent(
+        warp_cli::agent::AgentCommand::Run(run_agent_args_for_harness(Harness::OpenCode)),
+    )));
+}
+
+#[test]
+fn acp_agent_run_with_saved_prompt_requires_auth() {
+    let mut args = run_agent_args_for_harness(Harness::Acp);
+    args.prompt_arg.prompt = None;
+    args.prompt_arg.saved_prompt = Some("saved-prompt-id".to_string());
+
+    assert!(command_requires_auth(&CliCommand::Agent(
+        warp_cli::agent::AgentCommand::Run(args),
+    )));
+}
+
+#[test]
+fn acp_agent_run_with_warp_server_features_requires_auth() {
+    let mut args = run_agent_args_for_harness(Harness::Acp);
+    args.share.share = Some(Vec::new());
+
+    assert!(command_requires_auth(&CliCommand::Agent(
+        warp_cli::agent::AgentCommand::Run(args),
+    )));
 }
 
 #[test]

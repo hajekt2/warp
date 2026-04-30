@@ -664,9 +664,12 @@ impl AgentDriver {
             )
         );
 
-        // If we're not logged in, the root view will go to an auth screen, and all subsequent steps will fail.
-        // This should be impossible, since we enforce login before reaching this point.
-        if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
+        // Local ACP agents are user-provided subprocesses and can run without a Warp account.
+        // Server-backed harnesses still require auth because their setup uses Warp APIs and
+        // account-scoped state.
+        if !matches!(selected_harness, Harness::Acp | Harness::OpenCode)
+            && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
+        {
             return Err(AgentDriverError::NotLoggedIn);
         }
 
