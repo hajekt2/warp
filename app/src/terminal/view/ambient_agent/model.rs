@@ -614,11 +614,18 @@ impl AmbientAgentViewModel {
                     })
                     .await?
                     .map_err(|error| anyhow!(error))?;
+                log::info!(
+                    "Local ACP agent '{}' created history conversation {}",
+                    agent_id.as_str(),
+                    stream_handle.conversation_id
+                );
 
                 let (output_tx, mut output_rx) =
                     tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
                 let acp_run = tokio::task::spawn_blocking(move || {
+                    log::info!("Local ACP spawning subprocess");
                     let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
+                    log::info!("Local ACP subprocess spawned; initializing");
                     let fs_capabilities = match (
                         request_policy.allow_read_text_file,
                         request_policy.allow_write_text_file,
@@ -638,9 +645,15 @@ impl AmbientAgentViewModel {
                                 .with_terminal(request_policy.allow_terminal),
                         ))
                         .map_err(anyhow::Error::from)?;
+                    log::info!(
+                        "Local ACP initialized agent {:?} with {} auth method(s)",
+                        initialize_response.agent_info,
+                        initialize_response.auth_methods.len()
+                    );
                     if let Some(method_id) =
                         AgentDriver::preferred_acp_auth_method(&initialize_response.auth_methods)
                     {
+                        log::info!("Local ACP authenticating with method `{method_id}`");
                         client
                             .authenticate(AuthenticateRequest::new(method_id.clone()))
                             .with_context(|| {
@@ -654,6 +667,7 @@ impl AmbientAgentViewModel {
                     let session = client
                         .new_session(NewSessionRequest::new(working_dir).with_mcp_servers(mcp_servers))
                         .map_err(anyhow::Error::from)?;
+                    log::info!("Local ACP session created: {:?}", session.session_id);
                     let session_id = session.session_id.clone();
                     let mut request_handler = LocalClientRequestHandler::new(request_policy)
                         .map_err(|error| anyhow!(error))?;
@@ -671,11 +685,14 @@ impl AmbientAgentViewModel {
                                     if builder.apply_update(update) {
                                         let _ = output_tx.send(builder.output());
                                     }
+                                } else {
+                                    log::debug!("Ignoring non-session ACP agent message: {message:?}");
                                 }
                             },
                             move |message, transport| request_handler.handle(message, transport),
                         )
                         .map_err(anyhow::Error::from)?;
+                    log::info!("Local ACP prompt completed");
                     let _ = client.close_session(session_id);
                     let output = output.lock().expect("ACP output builder poisoned").output();
                     Ok::<_, anyhow::Error>(output)
@@ -766,7 +783,10 @@ impl AmbientAgentViewModel {
                     .await?
                     .map_err(|error| anyhow!(error))?;
                 if let Some(error) = run_error {
-                    return Err(error);
+                    log::warn!(
+                        "Local ACP agent '{}' finished with visible conversation error: {error:#}",
+                        agent_id.as_str()
+                    );
                 }
                 Ok::<_, anyhow::Error>(conversation_id)
             },

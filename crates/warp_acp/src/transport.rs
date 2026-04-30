@@ -73,6 +73,17 @@ impl JsonRpcStdioTransport {
             .stdin
             .take()
             .ok_or(JsonRpcTransportError::MissingPipe)?;
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if !line.trim().is_empty() {
+                        log::warn!("ACP agent stderr: {line}");
+                    }
+                }
+            });
+        }
         Ok(Self::from_reader_writer(stdout, stdin, Some(child)))
     }
 

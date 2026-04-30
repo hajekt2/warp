@@ -707,6 +707,93 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 }
 
 #[test]
+fn enter_surfaces_configured_acp_agent_failure_in_agent_history() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-failing-agent-{}-{}.sh",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"failing-fixture","version":"test"},"authMethods":[]}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom from failing ACP fixture"}}'
+"#,
+        )
+        .expect("write failing ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Fail ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("fail-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
+                    .active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                let output = exchange.format_output_for_copy(None);
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && exchange.output_status.is_finished_and_successful()
+                    && output.contains("ACP agent failed")
+                    && output.contains("boom from failing ACP fixture")
+            }),
+            "configured ACP failures should open the local agent conversation and render the error instead of returning to an empty composer"
+        );
+
+        let _ = fs::remove_file(script_path);
+    });
+}
+
+#[test]
 fn set_input_mode_agent_does_not_enter_local_agent_from_root_cloud_mode_pane() {
     use crate::terminal::shared_session::SharedSessionStatus;
 
