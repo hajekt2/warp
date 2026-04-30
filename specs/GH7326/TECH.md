@@ -23,14 +23,14 @@ Warp advertises capabilities from a per-run snapshot of the active Agent Mode au
 - No `sh -c`, shell expansion, pipes, or redirection in configured agent launch.
 - Resolve command paths before launch and report missing executables with registry install URLs when available.
 - Do not sync executable command/args/env in a way that silently executes on another device; require local confirmation.
-- MCP forwarding is per-agent/per-server opt-in, with env/secret redaction in logs, snapshots, and error UI.
+- MCP forwarding is per-agent/per-server opt-in. Allowlist entries can reference explicit stdio argv (`name | command args`) or Warp-installed templatable MCP servers by UUID/name; env/header values remain local and must be redacted from logs, snapshots, and error UI.
 - `fs/write_text_file`, `terminal/create`, and `session/request_permission` return only after Warp applies the active approval policy; disallowed requests return JSON-RPC errors or a cancellation-shaped permission response.
 
 ## Current Implementation Notes
 
 - `Harness::Acp` is a fieldless coarse slug only. Dynamic per-agent identity lives in settings and UI state, not in `CLIAgent` or a field-bearing `Harness` enum variant.
 - `AgentHarnessSelection::{Builtin, Acp}` preserves existing built-in harness behavior while carrying `AcpAgentId` locally.
-- `crates/warp_acp` starts with local schema-shaped models; future work may replace these with `agent-client-protocol-schema` after resolving the repo's MCP dependency constraints.
+- `crates/warp_acp` owns local schema-shaped models for initialize/auth/session/list/load/resume/close, fs, terminal, permission, stdio MCP, and capability-gated SSE/HTTP MCP shapes; future work may replace these with `agent-client-protocol-schema` after resolving the repo's MCP dependency constraints.
 
 ## Rollout
 
@@ -42,4 +42,4 @@ ACP client support remains guarded by `FeatureFlag::AcpClient`, but `acp_client`
 - Settings tests for serialization, feature gating, and local-only ACP config storage.
 - UI model/selector tests for built-in and configured ACP entries.
 - Integration fixture binary for ACP initialize/session/new/session/prompt echo.
-- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, MCP allowlist with redaction, fs read/write bridge, terminal lifecycle bridge, and session list/load/resume/close protocol calls.
+- Manual matrix: `opencode acp --port 0`, `codex-acp`, missing command, crash during handshake, streaming output into a Warp block, MCP allowlist by explicit argv and installed server UUID/name, fs read/write bridge, terminal lifecycle bridge, and session list/load/resume/close protocol calls.

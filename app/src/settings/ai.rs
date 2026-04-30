@@ -1819,6 +1819,32 @@ impl AISettings {
         report_if_error!(self.acp_agent_configs.set_value(configs, ctx));
     }
 
+    pub fn upsert_acp_agent_config(
+        &mut self,
+        mut config: AcpAgentConfig,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::AcpClient.is_enabled() {
+            return;
+        }
+        config.name = config.name.trim().to_string();
+        config.command = config.command.trim().to_string();
+        if config.id.as_str().trim().is_empty()
+            || config.name.is_empty()
+            || config.command.is_empty()
+        {
+            return;
+        }
+
+        let mut configs = self.acp_agent_configs.value().clone();
+        if let Some(existing) = configs.iter_mut().find(|existing| existing.id == config.id) {
+            *existing = config;
+        } else {
+            configs.push(config);
+        }
+        report_if_error!(self.acp_agent_configs.set_value(configs, ctx));
+    }
+
     pub fn remove_acp_agent_config(&mut self, id: &AcpAgentId, ctx: &mut ModelContext<Self>) {
         if !FeatureFlag::AcpClient.is_enabled() {
             return;

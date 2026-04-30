@@ -62,6 +62,13 @@ pub use conversation_loader::{
 
 pub(super) const MAX_HISTORICAL_CONVERSATIONS: usize = 100;
 
+#[derive(Debug, Clone)]
+pub(crate) struct AcpStreamingExchangeHandle {
+    pub(crate) conversation_id: AIConversationId,
+    pub(crate) exchange_id: AIAgentExchangeId,
+    pub(crate) message_id: MessageId,
+}
+
 /// Metadata for conversations
 /// When created from local DB, has_local_data=true and server_metadata=None.
 /// When fetched from server, has_local_data=false and server_metadata=Some(...).
@@ -789,6 +796,107 @@ impl BlocklistAIHistoryModel {
         });
 
         new_conversation_id
+    }
+
+    pub(crate) fn start_acp_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        prompt: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<AcpStreamingExchangeHandle, UpdateHistoryError> {
+        let conversation_id = self.start_new_conversation(terminal_view_id, false, false, ctx);
+        self.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
+
+        let llm_prefs = LLMPreferences::as_ref(ctx);
+        let model_id = llm_prefs
+            .get_active_base_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let coding_model_id = llm_prefs
+            .get_active_coding_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let cli_agent_model_id = llm_prefs
+            .get_active_cli_agent_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let computer_use_model_id = llm_prefs
+            .get_active_computer_use_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+
+        let input = vec![AIAgentInput::UserQuery {
+            query: prompt,
+            context: Default::default(),
+            static_query_type: None,
+            referenced_attachments: Default::default(),
+            user_query_mode: UserQueryMode::default(),
+            running_command: None,
+            intended_agent: None,
+        }];
+
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        let (exchange_id, message_id) = conversation.append_streaming_text_exchange(
+            input,
+            String::new(),
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(AcpStreamingExchangeHandle {
+            conversation_id,
+            exchange_id,
+            message_id,
+        })
+    }
+
+    pub(crate) fn update_acp_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &AcpStreamingExchangeHandle,
+        output_text: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.update_streaming_text_exchange(
+            handle.exchange_id,
+            &handle.message_id,
+            output_text,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_acp_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &AcpStreamingExchangeHandle,
+        output_text: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        self.update_acp_streaming_exchange(terminal_view_id, handle, output_text, ctx)?;
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.finish_streaming_text_exchange(handle.exchange_id, terminal_view_id, ctx)?;
+        Ok(())
     }
 
     pub fn append_finished_acp_exchange(

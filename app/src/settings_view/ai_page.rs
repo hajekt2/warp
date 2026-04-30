@@ -21,7 +21,7 @@ use crate::cloud_object::JsonObjectType;
 use crate::cloud_object::ObjectType;
 
 use crate::editor::{EditorOptions, InteractionState, SingleLineEditorOptions, TextColors};
-use crate::settings::ai::AcpAgentId;
+use crate::settings::ai::{AcpAgentConfig, AcpAgentEnvValue, AcpAgentEnvVar, AcpAgentId};
 use crate::settings::InputSettings;
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
@@ -1360,14 +1360,23 @@ impl AISettingsPageView {
         let acp_agent_custom_editor = ctx.add_typed_action_view(|ctx| {
             let mut input = SubmittableTextInput::new(ctx)
                 .validate_on_submit(|s| parse_acp_agent_input(s).is_some());
-            input.set_placeholder_text("Name | command arg1 arg2", ctx);
+            input.set_placeholder_text("Name | command arg1 arg2 OR id | Name | command args | env KEY=value | mcp server-id", ctx);
             input
         });
         ctx.subscribe_to_view(&acp_agent_custom_editor, |_, _, event, ctx| {
             if let SubmittableTextInputEvent::Submit(input) = event {
-                if let Some((name, command, args)) = parse_acp_agent_input(input) {
-                    AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                        settings.add_custom_acp_agent_config(&name, &command, args, ctx);
+                if let Some(input) = parse_acp_agent_input(input) {
+                    AISettings::handle(ctx).update(ctx, |settings, ctx| match input {
+                        ParsedAcpAgentInput::Add {
+                            name,
+                            command,
+                            args,
+                        } => {
+                            settings.add_custom_acp_agent_config(&name, &command, args, ctx);
+                        }
+                        ParsedAcpAgentInput::Upsert(config) => {
+                            settings.upsert_acp_agent_config(config, ctx);
+                        }
                     });
                     ctx.notify();
                 }
@@ -6070,15 +6079,114 @@ impl SettingsWidget for CLIAgentWidget {
     }
 }
 
-fn parse_acp_agent_input(input: &str) -> Option<(String, String, Vec<String>)> {
-    let (name, argv) = input.split_once('|')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
+enum ParsedAcpAgentInput {
+    Add {
+        name: String,
+        command: String,
+        args: Vec<String>,
+    },
+    Upsert(AcpAgentConfig),
+}
+
+fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
+    let parts: Vec<_> = input
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    match parts.as_slice() {
+        [name, argv] => {
+            let (command, args) = parse_acp_argv(argv)?;
+            Some(ParsedAcpAgentInput::Add {
+                name: (*name).to_string(),
+                command,
+                args,
+            })
+        }
+        [id, name, argv, directives @ ..] => {
+            let (command, args) = parse_acp_argv(argv)?;
+            let mut config = AcpAgentConfig {
+                id: AcpAgentId::new(*id),
+                name: (*name).to_string(),
+                command,
+                args,
+                env: Vec::new(),
+                mcp_allowlist: Vec::new(),
+                install_url: None,
+                registry_key: None,
+                local_confirmation: Default::default(),
+            };
+            config.local_confirmation.confirmed_on_this_device = true;
+
+            for directive in directives {
+                let Some((key, value)) = directive.split_once(char::is_whitespace) else {
+                    continue;
+                };
+                let value = value.trim();
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "env" => {
+                        config.env = parse_acp_env_directive(value)?;
+                    }
+                    "mcp" => {
+                        config.mcp_allowlist = parse_acp_list_directive(value);
+                    }
+                    "install" | "install_url" => {
+                        config.install_url = (!value.is_empty()).then(|| value.to_string());
+                    }
+                    "registry" | "registry_key" => {
+                        config.registry_key = (!value.is_empty()).then(|| value.to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            if config.id.as_str().trim().is_empty() || config.name.trim().is_empty() {
+                return None;
+            }
+            Some(ParsedAcpAgentInput::Upsert(config))
+        }
+        _ => None,
     }
+}
+
+fn parse_acp_argv(argv: &str) -> Option<(String, Vec<String>)> {
     let argv = shell_words::split(argv.trim()).ok()?;
     let (command, args) = argv.split_first()?;
-    Some((name.to_string(), command.clone(), args.to_vec()))
+    Some((command.clone(), args.to_vec()))
+}
+
+fn parse_acp_env_directive(value: &str) -> Option<Vec<AcpAgentEnvVar>> {
+    let mut env = Vec::new();
+    for token in shell_words::split(value).ok()? {
+        let (name, value) = token.split_once('=')?;
+        if name.is_empty() {
+            return None;
+        }
+        let value = if let Some(key) = value.strip_prefix("secret:") {
+            AcpAgentEnvValue::SecretRef {
+                key: key.to_string(),
+            }
+        } else {
+            AcpAgentEnvValue::Literal {
+                value: value.to_string(),
+            }
+        };
+        env.push(AcpAgentEnvVar {
+            name: name.to_string(),
+            value,
+        });
+    }
+    Some(env)
+}
+
+fn parse_acp_list_directive(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn acp_action_mouse_state(view: &AISettingsPageView, key: impl Into<String>) -> MouseStateHandle {
@@ -6128,7 +6236,7 @@ fn render_acp_agents_settings(
         appearance
             .ui_builder()
             .paragraph(
-                "Add a custom local agent with `Name | command arg1 arg2`. Warp parses this into argv and still launches without shell expansion."
+                "Add with `Name | command arg1 arg2`. Edit an existing agent with `id | Name | command arg1 | env KEY=value | mcp server-id`. Use `secret:KEY` for environment variables stored outside synced settings."
             )
             .with_style(UiComponentStyles {
                 font_size: Some(appearance.ui_font_size()),
@@ -6192,6 +6300,30 @@ fn render_acp_agents_settings(
                     .with_style(UiComponentStyles {
                         font_color: Some(description_color),
                         font_family_id: Some(appearance.monospace_font_family()),
+                        font_size: Some(appearance.ui_font_size()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .wrappable_text(
+                        format!(
+                            "id: {} · env: {} · allowed MCP: {}",
+                            agent.id,
+                            agent.env.len(),
+                            if agent.mcp_allowlist.is_empty() {
+                                "none".to_string()
+                            } else {
+                                agent.mcp_allowlist.join(", ")
+                            }
+                        ),
+                        true,
+                    )
+                    .with_style(UiComponentStyles {
+                        font_color: Some(description_color),
                         font_size: Some(appearance.ui_font_size()),
                         ..Default::default()
                     })

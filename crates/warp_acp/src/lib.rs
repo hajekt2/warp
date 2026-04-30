@@ -28,18 +28,18 @@ pub use registry::{
     codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,
 };
 pub use schema::{
-    conservative_initialize_request, AcpEnvironmentEntry, AuthenticateRequest,
+    conservative_initialize_request, AcpEnvironmentEntry, AcpHttpHeader, AuthenticateRequest,
     AuthenticateResponse, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
     ContentBlock, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
     Implementation, InitializeRequest, InitializeResponse, KillTerminalResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PermissionOption, PromptRequest,
-    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse, SessionId,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TerminalExitStatus, TerminalOutputResponse,
-    TerminalRefRequest, TextContent, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    McpServerHttp, McpServerSse, McpServerStdio, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionId, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TerminalExitStatus, TerminalOutputResponse, TerminalRefRequest, TextContent,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 pub use transport::{JsonRpcStdioTransport, JsonRpcTransportError};

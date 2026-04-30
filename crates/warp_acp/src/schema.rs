@@ -199,9 +199,66 @@ impl SessionId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpServer {
+    /// HTTP transport is available only when the agent advertises `mcpCapabilities.http`.
+    Http(McpServerHttp),
+    /// Server-Sent Events transport is available only when the agent advertises
+    /// `mcpCapabilities.sse`.
+    Sse(McpServerSse),
     /// Stdio is untagged in the official ACP schema because every agent must support it.
     #[serde(untagged)]
     Stdio(McpServerStdio),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerHttp {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<AcpHttpHeader>,
+}
+
+impl McpServerHttp {
+    #[must_use]
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn headers(mut self, headers: impl IntoIterator<Item = AcpHttpHeader>) -> Self {
+        self.headers = headers.into_iter().collect();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerSse {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<AcpHttpHeader>,
+}
+
+impl McpServerSse {
+    #[must_use]
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn headers(mut self, headers: impl IntoIterator<Item = AcpHttpHeader>) -> Self {
+        self.headers = headers.into_iter().collect();
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,6 +614,13 @@ pub struct AcpEnvironmentEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpHttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateTerminalResponse {
     pub terminal_id: String,
 }
@@ -670,6 +734,28 @@ mod tests {
         assert_eq!(value["sessionId"], "session-1");
         assert_eq!(value["prompt"][0]["type"], "text");
         assert_eq!(value["prompt"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn mcp_servers_serialize_official_stdio_and_sse_shapes() {
+        let stdio = McpServer::Stdio(McpServerStdio::new("local", "/bin/echo").args(["hello"]));
+        let stdio_value = serde_json::to_value(stdio).unwrap();
+        assert_eq!(stdio_value["name"], "local");
+        assert_eq!(stdio_value["command"], "/bin/echo");
+        assert_eq!(stdio_value["args"][0], "hello");
+        assert!(stdio_value.get("type").is_none());
+
+        let sse = McpServer::Sse(
+            McpServerSse::new("remote", "https://example.test/sse").headers([AcpHttpHeader {
+                name: "Authorization".to_string(),
+                value: "Bearer token".to_string(),
+            }]),
+        );
+        let sse_value = serde_json::to_value(sse).unwrap();
+        assert_eq!(sse_value["type"], "sse");
+        assert_eq!(sse_value["name"], "remote");
+        assert_eq!(sse_value["url"], "https://example.test/sse");
+        assert_eq!(sse_value["headers"][0]["name"], "Authorization");
     }
 
     #[test]

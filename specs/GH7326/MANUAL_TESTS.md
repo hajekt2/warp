@@ -42,7 +42,9 @@ Automated unit coverage now exercises:
 - rejection of file paths outside the workspace;
 - workspace-contained `fs/write_text_file` when the policy enables writes;
 - ACP `session/list`, `session/load`, `session/resume`, and `session/close` client requests;
-- child-process shutdown through transport drop.
+- child-process shutdown through transport drop;
+- live ACP update plumbing from `session/update` notifications into a streaming Warp conversation exchange;
+- official ACP MCP server serialization for untagged stdio and tagged SSE entries.
 
 Run:
 

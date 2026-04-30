@@ -47,7 +47,8 @@ use crate::{
                 failed_icon, gray_stop_icon, in_progress_icon, succeeded_icon, yellow_stop_icon,
             },
             todos::AIAgentTodoList,
-            AIAgentOutputMessage, AIAgentOutputMessageType, MessageToAIAgentOutputMessageError,
+            AIAgentOutputMessage, AIAgentOutputMessageType, AIAgentText, AIAgentTextSection,
+            AgentOutputText, MessageToAIAgentOutputMessageError,
         },
         blocklist::BlocklistAIHistoryEvent,
     },
@@ -2601,6 +2602,140 @@ impl AIConversation {
         self.task_store
             .exchange_mut(exchange_id)
             .ok_or(UpdateConversationError::ExchangeNotFound)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_streaming_text_exchange(
+        &mut self,
+        input: Vec<AIAgentInput>,
+        initial_output_text: String,
+        working_directory: Option<String>,
+        model_id: LLMId,
+        coding_model_id: LLMId,
+        cli_agent_model_id: LLMId,
+        computer_use_model_id: LLMId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(AIAgentExchangeId, MessageId), UpdateConversationError> {
+        let exchange_id = AIAgentExchangeId::new();
+        let message_id = MessageId::new(Uuid::new_v4().to_string());
+        let task_id = self.get_root_task_id().clone();
+        let output = AIAgentOutput {
+            messages: vec![AIAgentOutputMessage::text(
+                message_id.clone(),
+                AIAgentText {
+                    sections: vec![AIAgentTextSection::PlainText {
+                        text: AgentOutputText::from(initial_output_text),
+                    }],
+                },
+            )],
+            ..Default::default()
+        };
+        let now = Local::now();
+        let exchange = AIAgentExchange {
+            id: exchange_id,
+            input,
+            output_status: AIAgentOutputStatus::Streaming {
+                output: Some(Shared::new(output)),
+            },
+            added_message_ids: HashSet::new(),
+            start_time: now,
+            finish_time: None,
+            time_to_first_token_ms: None,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            request_cost: None,
+            response_initiator: None,
+        };
+        self.append_exchange_to_task(&task_id, exchange)?;
+        ctx.emit(BlocklistAIHistoryEvent::AppendedExchange {
+            exchange_id,
+            task_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+            response_stream_id: None,
+        });
+        Ok((exchange_id, message_id))
+    }
+
+    pub(crate) fn update_streaming_text_exchange(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        message_id: &MessageId,
+        output_text: String,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming {
+            output: Some(output),
+        } = &exchange.output_status
+        else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        let mut output = output.get_mut();
+        if let Some(message) = output
+            .messages
+            .iter_mut()
+            .find(|message| &message.id == message_id)
+        {
+            message.message = AIAgentOutputMessageType::Text(AIAgentText {
+                sections: vec![AIAgentTextSection::PlainText {
+                    text: AgentOutputText::from(output_text),
+                }],
+            });
+        } else {
+            output.messages.push(AIAgentOutputMessage::text(
+                message_id.clone(),
+                AIAgentText {
+                    sections: vec![AIAgentTextSection::PlainText {
+                        text: AgentOutputText::from(output_text),
+                    }],
+                },
+            ));
+        }
+        drop(output);
+        let conversation_id = self.id;
+        let is_hidden = self.is_exchange_hidden(exchange_id);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish_streaming_text_exchange(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming { output } = &exchange.output_status else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        let Some(output) = output.as_ref().map(Shared::get_owned) else {
+            return Err(UpdateConversationError::OutputNeverInitialized);
+        };
+        exchange.output_status = AIAgentOutputStatus::Finished {
+            finished_output: FinishedAIAgentOutput::Success { output },
+        };
+        exchange.finish_time = Some(Local::now());
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: self.is_exchange_hidden(exchange_id),
+        });
+        self.write_updated_conversation_state(ctx);
+        self.update_status(ConversationStatus::Success, terminal_view_id, ctx);
+        Ok(())
     }
 
     pub(crate) fn append_finished_text_exchange(

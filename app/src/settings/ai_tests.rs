@@ -498,6 +498,53 @@ fn test_add_custom_acp_agent_config_generates_unique_local_ids() {
 }
 
 #[test]
+fn test_upsert_acp_agent_config_replaces_existing_agent() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_custom_acp_agent_config("Local Agent", "old-acp", Vec::new(), ctx);
+            settings.upsert_acp_agent_config(
+                AcpAgentConfig {
+                    id: AcpAgentId::new("local-agent"),
+                    name: "Local Agent Updated".to_string(),
+                    command: "new-acp".to_string(),
+                    args: vec!["--stdio".to_string()],
+                    env: vec![AcpAgentEnvVar {
+                        name: "TOKEN".to_string(),
+                        value: AcpAgentEnvValue::SecretRef {
+                            key: "token".to_string(),
+                        },
+                    }],
+                    mcp_allowlist: vec!["server-uuid".to_string()],
+                    install_url: Some("https://example.test".to_string()),
+                    registry_key: None,
+                    local_confirmation: AcpAgentLocalConfirmation {
+                        confirmed_on_this_device: true,
+                        confirmed_at: None,
+                    },
+                },
+                ctx,
+            );
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let configs = settings.configured_acp_agents();
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].name, "Local Agent Updated");
+            assert_eq!(configs[0].command, "new-acp");
+            assert_eq!(configs[0].args, &["--stdio"]);
+            assert_eq!(configs[0].mcp_allowlist, &["server-uuid"]);
+            assert!(matches!(
+                configs[0].env[0].value,
+                AcpAgentEnvValue::SecretRef { .. }
+            ));
+        });
+    });
+}
+
+#[test]
 fn test_toolbar_command_map_matched_agent() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
