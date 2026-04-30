@@ -690,10 +690,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
                 BlocklistAIHistoryModel::as_ref(ctx)
                     .active_conversation(view.view_id)
                     .and_then(|conversation| conversation.latest_exchange())
-                    .map(|exchange| exchange.format_output_for_copy(None).contains("echo: test"))
+                    .map(|exchange| {
+                        exchange.output_status.is_finished_and_successful()
+                            && exchange.format_output_for_copy(None).contains("echo: test")
+                    })
                     .unwrap_or(false)
             }),
-            "configured ACP login fixture should stream output instead of calling authenticate"
+            "configured ACP login fixture should finish the submit loop and stream output instead of calling authenticate"
         );
 
         let _ = fs::remove_file(script_path);
