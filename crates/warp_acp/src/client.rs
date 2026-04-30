@@ -312,15 +312,47 @@ mod tests {
         }
     }
 
+    struct ResponseAfterRequestWrite {
+        response: Cursor<Vec<u8>>,
+        captured_writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for ResponseAfterRequestWrite {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            while self.captured_writes.lock().unwrap().is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            let n = self.response.read(buf)?;
+            if n == 0 {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            Ok(n)
+        }
+    }
+
+    fn client_with_response(response: &'static [u8]) -> (AcpClient, Arc<Mutex<Vec<u8>>>) {
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        (
+            AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
+                ResponseAfterRequestWrite {
+                    response: Cursor::new(response.to_vec()),
+                    captured_writes: Arc::clone(&captured),
+                },
+                writer,
+                None,
+            )),
+            captured,
+        )
+    }
+
     #[test]
     fn initialize_rejects_newer_agent_protocol() {
-        let input = Cursor::new(br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":999,"agentCapabilities":{},"agentInfo":{"name":"future"},"authMethods":[]}}
-"#.to_vec());
-        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
-            input,
-            SharedWriter::default(),
-            None,
-        ));
+        let (client, _) = client_with_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":999,"agentCapabilities":{},"agentInfo":{"name":"future"},"authMethods":[]}}
+"#,
+        );
 
         let error = client.initialize("Warp").unwrap_err();
 
@@ -332,16 +364,10 @@ mod tests {
 
     #[test]
     fn sends_new_session_request() {
-        let input = Cursor::new(
+        let (client, captured) = client_with_response(
             br#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1"}}
-"#
-            .to_vec(),
+"#,
         );
-        let writer = SharedWriter::default();
-        let captured = Arc::clone(&writer.0);
-        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
-            input, writer, None,
-        ));
 
         let response = client.new_session(NewSessionRequest::new("/tmp")).unwrap();
 
@@ -371,41 +397,6 @@ mod tests {
 
     #[test]
     fn sends_session_lifecycle_requests() {
-        struct ResponseAfterRequestWrite {
-            response: Cursor<Vec<u8>>,
-            captured_writes: Arc<Mutex<Vec<u8>>>,
-        }
-
-        impl Read for ResponseAfterRequestWrite {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                while self.captured_writes.lock().unwrap().is_empty() {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-
-                let n = self.response.read(buf)?;
-                if n == 0 {
-                    std::thread::sleep(Duration::from_secs(60));
-                }
-                Ok(n)
-            }
-        }
-
-        fn client_with_response(response: &'static [u8]) -> (AcpClient, Arc<Mutex<Vec<u8>>>) {
-            let writer = SharedWriter::default();
-            let captured = Arc::clone(&writer.0);
-            (
-                AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
-                    ResponseAfterRequestWrite {
-                        response: Cursor::new(response.to_vec()),
-                        captured_writes: Arc::clone(&captured),
-                    },
-                    writer,
-                    None,
-                )),
-                captured,
-            )
-        }
-
         let (client, captured) = client_with_response(
             br#"{"jsonrpc":"2.0","id":1,"result":{"sessions":[{"sessionId":"s1"}]}}
 "#,

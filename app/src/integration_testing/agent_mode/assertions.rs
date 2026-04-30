@@ -72,6 +72,11 @@ pub fn assert_exchange_text_contains(
     assert_exchange_text(exchange_index, move |text| text.contains(expected_text))
 }
 
+// Helper function to assert that the latest exchange text contains a specific string.
+pub fn assert_latest_exchange_text_contains(expected_text: &'static str) -> AssertionCallback {
+    assert_latest_exchange_text(move |text| text.contains(expected_text))
+}
+
 // Make an assertion on the text output in the latest exchange.
 // This assumes the AI block has completed successfully.
 pub fn assert_latest_exchange_text(

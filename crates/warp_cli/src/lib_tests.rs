@@ -1527,7 +1527,10 @@ fn harness_parse_orchestration_harness_accepts_aliases() {
         Harness::parse_orchestration_harness("open_code"),
         Some(Harness::OpenCode)
     );
-    assert_eq!(Harness::parse_orchestration_harness("acp"), Some(Harness::Acp));
+    assert_eq!(
+        Harness::parse_orchestration_harness("acp"),
+        Some(Harness::Acp)
+    );
 }
 
 #[test]
