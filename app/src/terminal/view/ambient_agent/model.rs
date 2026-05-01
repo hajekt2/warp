@@ -586,6 +586,7 @@ impl AmbientAgentViewModel {
         };
         let mcp_servers = AgentDriver::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
         let foreground = ctx.spawner();
+        let existing_conversation_id = self.conversation_id;
 
         self.harness_command_started = true;
         self.status = Status::AgentRunning;
@@ -604,8 +605,9 @@ impl AmbientAgentViewModel {
                 let stream_handle = foreground
                     .spawn(move |_, ctx| {
                         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                            history.start_acp_streaming_exchange(
+                            history.start_acp_streaming_exchange_in_conversation(
                                 terminal_view_id,
+                                existing_conversation_id,
                                 prompt_for_history,
                                 Some(working_dir_for_history.display().to_string()),
                                 ctx,
@@ -800,7 +802,8 @@ impl AmbientAgentViewModel {
             },
             |me, result, ctx| {
                 match result {
-                    Ok(_conversation_id) => {
+                    Ok(conversation_id) => {
+                        me.conversation_id = Some(conversation_id);
                         me.status = Status::Composing;
                         ctx.emit(AmbientAgentViewModelEvent::EnteredComposingState);
                     }

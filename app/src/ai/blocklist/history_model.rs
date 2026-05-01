@@ -807,7 +807,26 @@ impl BlocklistAIHistoryModel {
         working_directory: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) -> Result<AcpStreamingExchangeHandle, UpdateHistoryError> {
-        let conversation_id = self.start_new_conversation(terminal_view_id, false, false, ctx);
+        self.start_acp_streaming_exchange_in_conversation(
+            terminal_view_id,
+            None,
+            prompt,
+            working_directory,
+            ctx,
+        )
+    }
+
+    pub(crate) fn start_acp_streaming_exchange_in_conversation(
+        &mut self,
+        terminal_view_id: EntityId,
+        conversation_id: Option<AIConversationId>,
+        prompt: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<AcpStreamingExchangeHandle, UpdateHistoryError> {
+        let conversation_id = conversation_id
+            .filter(|conversation_id| self.conversations_by_id.contains_key(conversation_id))
+            .unwrap_or_else(|| self.start_new_conversation(terminal_view_id, false, false, ctx));
         self.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
 
         let llm_prefs = LLMPreferences::as_ref(ctx);
