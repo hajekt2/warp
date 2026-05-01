@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use warpui::{
     elements::Empty, platform::WindowStyle, App, AppContext, Element, Entity, ModelHandle,
     TypedActionView, View, ViewContext,
 };
 
-use super::{SessionId, Sessions, SessionsEvent};
+use super::{
+    BootstrapSessionType, InitShellValue, SessionId, SessionInfo, Sessions, SessionsEvent,
+    ShellLaunchData, ShellType,
+};
 
 struct TestView {
     events: Vec<SessionsEvent>,
@@ -99,4 +103,49 @@ fn test_set_env_var_emits_no_event_when_no_change() {
             assert_eq!(view.events.len(), 1);
         });
     });
+}
+
+#[test]
+fn create_pending_treats_locally_launched_shell_as_local_when_hostname_differs() {
+    let session_info = SessionInfo::create_pending(
+        ShellType::Bash,
+        InitShellValue {
+            hostname: "reported-by-shell-not-gethostname".to_string(),
+            ..Default::default()
+        },
+        None,
+        Some(ShellLaunchData::Executable {
+            executable_path: PathBuf::from("/bin/bash"),
+            shell_type: ShellType::Bash,
+        }),
+        None,
+        false,
+        None,
+    );
+
+    assert_eq!(session_info.session_type, BootstrapSessionType::Local);
+}
+
+#[test]
+fn create_pending_keeps_explicit_warpified_ssh_session_remote() {
+    let session_info = SessionInfo::create_pending(
+        ShellType::Bash,
+        InitShellValue {
+            hostname: "reported-by-shell-not-gethostname".to_string(),
+            ..Default::default()
+        },
+        None,
+        Some(ShellLaunchData::Executable {
+            executable_path: PathBuf::from("/bin/bash"),
+            shell_type: ShellType::Bash,
+        }),
+        None,
+        true,
+        None,
+    );
+
+    assert_eq!(
+        session_info.session_type,
+        BootstrapSessionType::WarpifiedRemote
+    );
 }

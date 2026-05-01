@@ -611,13 +611,20 @@ impl SessionInfo {
             log::warn!("pending_local_shell_path was None for a local session");
         }
 
-        // Compare the hostname of the session bootstrap payload with the hostname of the machine
-        // to determine if this is a local or remote session.
-        let session_type = Self::determine_session_type(
-            &init_shell_value,
-            is_warpified_ssh_session
-                || matches!(&is_legacy_ssh_session, IsLegacySSHSession::Yes { .. }),
-        );
+        let is_explicit_remote_session = is_warpified_ssh_session
+            || matches!(&is_legacy_ssh_session, IsLegacySSHSession::Yes { .. });
+
+        // If Warp launched this shell locally, trust that local launch provenance over
+        // hostname comparison. Some Linux/X11/dev environments can report a shell hostname that
+        // differs from `gethostname()`, which made local sessions look remote and disabled local
+        // workspace UI like Project Explorer. Explicit SSH/warpified sessions still win.
+        let session_type = if launch_data.is_some() && !is_explicit_remote_session {
+            BootstrapSessionType::Local
+        } else {
+            // Compare the hostname of the session bootstrap payload with the hostname of the
+            // machine to determine if this is a local or remote session.
+            Self::determine_session_type(&init_shell_value, is_explicit_remote_session)
+        };
 
         let spawning_session_id = if matches!(session_type, BootstrapSessionType::WarpifiedRemote)
             || subshell_info.is_some()
