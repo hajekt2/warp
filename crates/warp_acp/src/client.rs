@@ -26,6 +26,8 @@ const SESSION_PROMPT_METHOD: &str = "session/prompt";
 const SESSION_CANCEL_METHOD: &str = "session/cancel";
 const SESSION_SET_CONFIG_OPTION_METHOD: &str = "session/set_config_option";
 const SESSION_SET_MODE_METHOD: &str = "session/set_mode";
+const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Error)]
 pub enum AcpClientError {
@@ -41,6 +43,7 @@ pub enum AcpClientError {
 pub struct AcpClient {
     transport: JsonRpcStdioTransport,
     initialize_timeout: Duration,
+    prompt_timeout: Duration,
 }
 
 impl AcpClient {
@@ -52,13 +55,20 @@ impl AcpClient {
     pub fn new(transport: JsonRpcStdioTransport) -> Self {
         Self {
             transport,
-            initialize_timeout: Duration::from_secs(10),
+            initialize_timeout: DEFAULT_INITIALIZE_TIMEOUT,
+            prompt_timeout: DEFAULT_PROMPT_TIMEOUT,
         }
     }
 
     #[must_use]
     pub fn with_initialize_timeout(mut self, timeout: Duration) -> Self {
         self.initialize_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
         self
     }
 
@@ -149,9 +159,11 @@ impl AcpClient {
         session_id: SessionId,
         prompt: Vec<ContentBlock>,
     ) -> Result<PromptResponse, AcpClientError> {
-        Ok(self
-            .transport
-            .request(SESSION_PROMPT_METHOD, PromptRequest { session_id, prompt })?)
+        Ok(self.transport.request_timeout(
+            SESSION_PROMPT_METHOD,
+            PromptRequest { session_id, prompt },
+            self.prompt_timeout,
+        )?)
     }
 
     /// Send a prompt while conservatively denying agent-initiated client requests.
@@ -200,7 +212,7 @@ impl AcpClient {
         Ok(self.transport.request_timeout_with_handler(
             SESSION_PROMPT_METHOD,
             PromptRequest { session_id, prompt },
-            Duration::from_secs(30),
+            self.prompt_timeout,
             |message, transport| match message {
                 AgentMessage::Notification { .. } => {
                     handle_message(message);
@@ -517,5 +529,16 @@ mod tests {
             serde_json::to_value(response).unwrap(),
             json!({"stopReason": "end_turn"})
         );
+    }
+
+    #[test]
+    fn prompt_timeout_defaults_to_long_running_agent_window() {
+        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
+            Cursor::new(Vec::new()),
+            SharedWriter::default(),
+            None,
+        ));
+
+        assert_eq!(client.prompt_timeout, Duration::from_secs(30 * 60));
     }
 }
