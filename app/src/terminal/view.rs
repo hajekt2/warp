@@ -6531,6 +6531,9 @@ impl TerminalView {
         // CLI-agent history should keep access to local workspace UI, while cloud ambient-agent
         // transcripts remain remote-gated.
         let model = self.model.lock();
+        if model.is_dummy_cloud_mode_session() {
+            return None;
+        }
         if model.is_shared_session_viewer() {
             return Some(false);
         }

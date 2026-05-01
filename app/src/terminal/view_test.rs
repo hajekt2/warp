@@ -2507,6 +2507,31 @@ fn test_alt_scroll_sequences() {
 }
 
 #[test]
+fn new_cloud_agent_composer_does_not_remote_gate_project_explorer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+        terminal.update(&mut app, |view, ctx| {
+            let is_local = view.active_session_is_local(ctx);
+            assert_eq!(is_local, None);
+
+            let enablement =
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::from_session_env(
+                    true,
+                    matches!(is_local, Some(false)),
+                    false,
+                    false,
+                );
+            assert_eq!(
+                enablement,
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::Enabled
+            );
+        });
+    })
+}
+
+#[test]
 fn local_conversation_transcript_keeps_project_explorer_enabled() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
