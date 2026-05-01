@@ -24,7 +24,8 @@ pub use client::{AcpClient, AcpClientError};
 pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
 pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
 pub use local_handler::{
-    AutoClientRequestUi, ClientRequestUi, LocalClientRequestHandler, LocalClientRequestPolicy,
+    AutoClientRequestUi, ClientRequestUi, LocalClientRequestError, LocalClientRequestHandler,
+    LocalClientRequestPolicy,
 };
 pub use registry::{
     codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,

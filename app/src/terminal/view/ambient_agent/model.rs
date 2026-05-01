@@ -1,17 +1,8 @@
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Context as _};
 use instant::Instant;
 use session_sharing_protocol::common::SessionId;
-use warp_acp::{
-    AcpClient, AgentMessage, AuthenticateRequest, ClientCapabilities, ContentBlock,
-    FileSystemCapabilities, Implementation, InitializeRequest, LocalClientRequestHandler,
-    LocalClientRequestPolicy, NewSessionRequest, SessionId as AcpSessionId,
-};
+use warp_acp::LocalClientRequestPolicy;
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
@@ -20,9 +11,8 @@ use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::agent::AIAgentOutput;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
-use crate::ai::agent_sdk::driver::{AcpStreamingOutputBuilder, AgentDriver};
+use crate::ai::agent_sdk::driver::AgentDriver;
 use crate::ai::agent_sdk::validate_cli_installed;
 use crate::ai::ambient_agents::spawn::{spawn_task, AmbientAgentEvent};
 use crate::ai::ambient_agents::task::HarnessConfig;
@@ -33,7 +23,9 @@ use crate::ai::ambient_agents::{
 };
 use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
-use crate::ai::execution_profiles::{CloudAgentComputerUseState, ComputerUsePermission};
+use crate::ai::execution_profiles::{
+    ActionPermission, CloudAgentComputerUseState, ComputerUsePermission,
+};
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
 use crate::server::cloud_objects::update_manager::UpdateManager;
@@ -45,6 +37,7 @@ use crate::server::server_api::{AIApiError, CloudAgentCapacityError, ServerApiPr
 use crate::settings::ai::{AISettings, AcpAgentId};
 use crate::terminal::view::ambient_agent::SetupCommandState;
 
+use super::local_acp::{LocalAcpAgentModel, LocalAcpClientRequestUi, LocalAcpPromptRequest};
 use super::AmbientAgentProgressUIState;
 
 /// Tracks progress timestamps for each step during ambient agent spawning.
@@ -118,31 +111,6 @@ impl AgentHarnessSelection {
     }
 }
 
-#[derive(Clone)]
-struct LocalAcpRuntimeSession {
-    agent_id: AcpAgentId,
-    command_argv: Vec<String>,
-    working_dir: PathBuf,
-    request_policy: LocalClientRequestPolicy,
-    client: Arc<AcpClient>,
-    session_id: AcpSessionId,
-}
-
-impl LocalAcpRuntimeSession {
-    fn matches(
-        &self,
-        agent_id: &AcpAgentId,
-        command_argv: &[String],
-        working_dir: &PathBuf,
-        request_policy: &LocalClientRequestPolicy,
-    ) -> bool {
-        &self.agent_id == agent_id
-            && self.command_argv == command_argv
-            && &self.working_dir == working_dir
-            && &self.request_policy == request_policy
-    }
-}
-
 /// Model to track the state of an ambient agent run.
 pub struct AmbientAgentViewModel {
     status: Status,
@@ -184,9 +152,8 @@ pub struct AmbientAgentViewModel {
     /// there is no oz `AppendedExchange` to key off of.
     harness_command_started: bool,
 
-    /// Live local ACP subprocess/session reused across follow-up prompts so the agent keeps
-    /// protocol-side context in addition to Warp's visible conversation history.
-    local_acp_session: Option<LocalAcpRuntimeSession>,
+    /// Local ACP runtime state, independent from cloud/Oz task metadata.
+    local_acp_agent: LocalAcpAgentModel,
 }
 
 impl AmbientAgentViewModel {
@@ -218,7 +185,7 @@ impl AmbientAgentViewModel {
             harness_selection: AgentHarnessSelection::default(),
             has_inserted_cloud_mode_user_query_block: false,
             harness_command_started: false,
-            local_acp_session: None,
+            local_acp_agent: LocalAcpAgentModel::new(),
         }
     }
 
@@ -543,6 +510,7 @@ impl AmbientAgentViewModel {
         self.environment_id = None;
         self.task_id = None;
         self.conversation_id = None;
+        self.local_acp_agent.reset();
         self.has_inserted_cloud_mode_user_query_block = false;
         self.harness_command_started = false;
         self.stop_progress_timer();
@@ -552,6 +520,7 @@ impl AmbientAgentViewModel {
     /// Sets the local conversation ID associated with this cloud agent run.
     pub fn set_conversation_id(&mut self, id: Option<AIConversationId>) {
         self.conversation_id = id;
+        self.local_acp_agent.set_conversation_id(id);
     }
 
     /// Spawn a configured local ACP agent directly in this terminal's agent history.
@@ -608,280 +577,64 @@ impl AmbientAgentViewModel {
             permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
         let request_policy = LocalClientRequestPolicy {
             workspace_root: working_dir.clone(),
-            allow_read_text_file: !read_files_setting.is_always_ask(),
-            allow_write_text_file: apply_diffs_setting.is_always_allow(),
-            allow_terminal: execute_commands_setting.is_always_allow(),
-            allow_permission_selection: apply_diffs_setting.is_always_allow()
-                || execute_commands_setting.is_always_allow(),
+            allow_read_text_file: !matches!(read_files_setting, ActionPermission::Unknown),
+            allow_write_text_file: !matches!(apply_diffs_setting, ActionPermission::Unknown),
+            allow_terminal: !matches!(execute_commands_setting, ActionPermission::Unknown),
+            allow_permission_selection: true,
         };
         let mcp_servers = AgentDriver::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
         let foreground = ctx.spawner();
-        let existing_conversation_id = self.conversation_id;
-        let existing_acp_session = self
-            .local_acp_session
-            .as_ref()
-            .filter(|session| {
-                session.matches(&agent_id, &command_argv, &working_dir, &request_policy)
-            })
-            .cloned();
+        let client_request_ui = Arc::new(LocalAcpClientRequestUi::new(
+            foreground.clone(),
+            read_files_setting.is_always_ask(),
+            !apply_diffs_setting.is_always_allow(),
+            !execute_commands_setting.is_always_allow(),
+        ));
+        let existing_conversation_id = self.local_acp_agent.conversation_id();
+        let existing_acp_session = self.local_acp_agent.matching_session(
+            &agent_id,
+            &command_argv,
+            &working_dir,
+            &request_policy,
+        );
 
+        self.local_acp_agent.mark_prompting();
         self.harness_command_started = true;
         self.status = Status::AgentRunning;
         ctx.emit(AmbientAgentViewModelEvent::DispatchedAgent);
         ctx.emit(AmbientAgentViewModelEvent::HarnessCommandStarted);
 
-        ctx.spawn(
-            async move {
-                log::info!(
-                    "Starting local ACP agent '{}' with argv {:?}",
-                    agent_id.as_str(),
-                    command_argv
-                );
-                let prompt_for_history = prompt.clone();
-                let working_dir_for_history = working_dir.clone();
-                let stream_handle = foreground
-                    .spawn(move |_, ctx| {
-                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                            history.start_acp_streaming_exchange_in_conversation(
-                                terminal_view_id,
-                                existing_conversation_id,
-                                prompt_for_history,
-                                Some(working_dir_for_history.display().to_string()),
-                                ctx,
-                            )
-                        })
-                    })
-                    .await?
-                    .map_err(|error| anyhow!(error))?;
-                log::info!(
-                    "Local ACP agent '{}' created history conversation {}",
-                    agent_id.as_str(),
-                    stream_handle.conversation_id
-                );
-                let ready_conversation_id = stream_handle.conversation_id;
-                foreground
-                    .spawn(move |_, ctx| {
-                        ctx.emit(AmbientAgentViewModelEvent::LocalAcpConversationReady {
-                            conversation_id: ready_conversation_id,
-                        });
-                    })
-                    .await?;
-
-                let (output_tx, mut output_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
-                let agent_id_for_session = agent_id.clone();
-                let acp_run = tokio::task::spawn_blocking(move || {
-                    let acp_session = if let Some(session) = existing_acp_session {
-                        log::info!(
-                            "Reusing local ACP session {:?} for agent '{}'",
-                            session.session_id,
-                            agent_id_for_session.as_str()
-                        );
-                        session
-                    } else {
-                        log::info!("Local ACP spawning subprocess");
-                        let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
-                        log::info!("Local ACP subprocess spawned; initializing");
-                        let fs_capabilities = match (
-                            request_policy.allow_read_text_file,
-                            request_policy.allow_write_text_file,
-                        ) {
-                            (true, true) => FileSystemCapabilities::read_write(),
-                            (true, false) => FileSystemCapabilities::read_only(),
-                            _ => FileSystemCapabilities::none(),
-                        };
-                        let initialize_response = client
-                            .initialize_with(InitializeRequest::new(
-                                Some(
-                                    Implementation::new("Warp")
-                                        .with_version(env!("CARGO_PKG_VERSION")),
-                                ),
-                                ClientCapabilities::conservative()
-                                    .with_file_system(fs_capabilities)
-                                    .with_terminal(request_policy.allow_terminal),
-                            ))
-                            .map_err(anyhow::Error::from)?;
-                        log::info!(
-                            "Local ACP initialized agent {:?} with {} auth method(s)",
-                            initialize_response.agent_info,
-                            initialize_response.auth_methods.len()
-                        );
-                        if let Some(method_id) =
-                            AgentDriver::preferred_acp_auth_method(&initialize_response.auth_methods)
-                        {
-                            log::info!("Local ACP authenticating with method `{method_id}`");
-                            client
-                                .authenticate(AuthenticateRequest::new(method_id.clone()))
-                                .with_context(|| {
-                                    format!("ACP authentication failed for method `{method_id}`")
-                                })?;
-                        }
-                        let mcp_servers = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
-                            mcp_servers,
-                            &initialize_response.agent_capabilities,
-                        );
-                        let session = client
-                            .new_session(
-                                NewSessionRequest::new(working_dir.clone())
-                                    .with_mcp_servers(mcp_servers),
-                            )
-                            .map_err(anyhow::Error::from)?;
-                        log::info!("Local ACP session created: {:?}", session.session_id);
-                        LocalAcpRuntimeSession {
-                            agent_id: agent_id_for_session,
-                            command_argv,
-                            working_dir,
-                            request_policy: request_policy.clone(),
-                            client: Arc::new(client),
-                            session_id: session.session_id,
-                        }
-                    };
-                    let mut request_handler = LocalClientRequestHandler::new(
-                        acp_session.request_policy.clone(),
-                    )
-                        .map_err(|error| anyhow!(error))?;
-                    let output = Arc::new(Mutex::new(AcpStreamingOutputBuilder::default()));
-                    let output_for_notifications = Arc::clone(&output);
-                    acp_session
-                        .client
-                        .prompt_with_agent_message_and_request_handler(
-                            acp_session.session_id.clone(),
-                            vec![ContentBlock::text(prompt)],
-                            move |message: AgentMessage| {
-                                if let Some(update) = AgentDriver::acp_session_update(&message) {
-                                    let mut builder = output_for_notifications
-                                        .lock()
-                                        .expect("ACP output builder poisoned");
-                                    if builder.apply_update(update) {
-                                        let _ = output_tx.send(builder.output());
-                                    }
-                                } else {
-                                    log::debug!("Ignoring non-session ACP agent message: {message:?}");
-                                }
-                            },
-                            move |message, transport| request_handler.handle(message, transport),
-                        )
-                        .map_err(anyhow::Error::from)?;
-                    log::info!("Local ACP prompt completed");
-                    let output = output.lock().expect("ACP output builder poisoned").output();
-                    Ok::<_, anyhow::Error>((output, acp_session))
-                });
-
-                tokio::pin!(acp_run);
-                let mut run_error = None;
-                let mut completed_acp_session = None;
-                let output_text = loop {
-                    tokio::select! {
-                        maybe_output = output_rx.recv() => {
-                            if let Some(output) = maybe_output {
-                                let handle = stream_handle.clone();
-                                foreground
-                                    .spawn(move |_, ctx| {
-                                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                                            history.update_acp_streaming_exchange_output(
-                                                terminal_view_id,
-                                                &handle,
-                                                output,
-                                                ctx,
-                                            )
-                                        })
-                                    })
-                                    .await?
-                                    .map_err(|error| anyhow!(error))?;
-                            }
-                        }
-                        result = &mut acp_run => {
-                            match result.map_err(|error| anyhow!(error))? {
-                                Ok((output, acp_session)) => {
-                                    completed_acp_session = Some(acp_session);
-                                    break output;
-                                }
-                                Err(error) => {
-                                    let error_text = format!("{error:#}");
-                                    log::error!(
-                                        "Local ACP agent '{}' failed: {}",
-                                        agent_id.as_str(),
-                                        error_text
-                                    );
-                                    run_error = Some(anyhow!(error_text.clone()));
-                                    break AcpStreamingOutputBuilder::error_output(format!(
-                                        "ACP agent failed: {error_text}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                };
-
-                while let Ok(output) = output_rx.try_recv() {
-                    let handle = stream_handle.clone();
-                    foreground
-                        .spawn(move |_, ctx| {
-                            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                                history.update_acp_streaming_exchange_output(
-                                    terminal_view_id,
-                                    &handle,
-                                    output,
-                                    ctx,
-                                )
-                            })
-                        })
-                        .await?
-                        .map_err(|error| anyhow!(error))?;
-                }
-
-                let final_output = if output_text.messages.is_empty() {
-                    AcpStreamingOutputBuilder::error_output(
-                        "ACP agent completed without streamed text output.",
-                    )
-                } else {
-                    output_text
-                };
-                let conversation_id = stream_handle.conversation_id;
-                foreground
-                    .spawn(move |_, ctx| {
-                        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                            history.update_acp_streaming_exchange_output(
-                                terminal_view_id,
-                                &stream_handle,
-                                final_output,
-                                ctx,
-                            )?;
-                            history.finish_acp_streaming_exchange_current_output(
-                                terminal_view_id,
-                                &stream_handle,
-                                ctx,
-                            )
-                        })
-                    })
-                    .await?
-                    .map_err(|error| anyhow!(error))?;
-                if let Some(error) = run_error {
-                    log::warn!(
-                        "Local ACP agent '{}' finished with visible conversation error: {error:#}",
-                        agent_id.as_str()
-                    );
-                }
-                let Some(acp_session) = completed_acp_session else {
-                    return Err(anyhow!("Local ACP prompt failed"));
-                };
-                Ok::<_, anyhow::Error>((conversation_id, acp_session))
-            },
-            |me, result, ctx| {
-                match result {
-                    Ok((conversation_id, acp_session)) => {
-                        me.conversation_id = Some(conversation_id);
-                        me.local_acp_session = Some(acp_session);
-                        me.status = Status::Composing;
-                        ctx.emit(AmbientAgentViewModelEvent::EnteredComposingState);
-                    }
-                    Err(error) => {
-                        me.local_acp_session = None;
-                        me.handle_spawn_error(format!("ACP agent failed: {error:#}"), ctx);
-                    }
-                }
-            },
+        let request = LocalAcpPromptRequest::new(
+            agent_id,
+            command,
+            command_argv,
+            prompt,
+            working_dir,
+            request_policy,
+            mcp_servers,
+            terminal_view_id,
+            existing_conversation_id,
+            existing_acp_session,
+            foreground,
+            client_request_ui,
         );
+
+        ctx.spawn(request.run(), |me, result, ctx| match result {
+            Ok(prompt_result) => {
+                me.conversation_id = Some(prompt_result.conversation_id);
+                me.local_acp_agent.mark_finished(
+                    prompt_result.conversation_id,
+                    prompt_result.into_runtime_session(),
+                );
+                me.status = Status::Composing;
+                ctx.emit(AmbientAgentViewModelEvent::EnteredComposingState);
+            }
+            Err(error) => {
+                let error_message = format!("ACP agent failed: {error:#}");
+                me.local_acp_agent.mark_failed(error_message.clone());
+                me.handle_spawn_error(error_message, ctx);
+            }
+        });
     }
 
     /// Spawn an ambient agent with the given prompt and current session configuration.

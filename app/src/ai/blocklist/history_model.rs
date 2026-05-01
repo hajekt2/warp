@@ -64,7 +64,7 @@ pub use conversation_loader::{
 pub(super) const MAX_HISTORICAL_CONVERSATIONS: usize = 100;
 
 #[derive(Debug, Clone)]
-pub(crate) struct AcpStreamingExchangeHandle {
+pub(crate) struct StreamingExchangeHandle {
     pub(crate) conversation_id: AIConversationId,
     pub(crate) exchange_id: AIAgentExchangeId,
     #[allow(dead_code)]
@@ -800,14 +800,14 @@ impl BlocklistAIHistoryModel {
         new_conversation_id
     }
 
-    pub(crate) fn start_acp_streaming_exchange(
+    pub(crate) fn start_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,
         prompt: String,
         working_directory: Option<String>,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<AcpStreamingExchangeHandle, UpdateHistoryError> {
-        self.start_acp_streaming_exchange_in_conversation(
+    ) -> Result<StreamingExchangeHandle, UpdateHistoryError> {
+        self.start_streaming_exchange_in_conversation(
             terminal_view_id,
             None,
             prompt,
@@ -816,14 +816,14 @@ impl BlocklistAIHistoryModel {
         )
     }
 
-    pub(crate) fn start_acp_streaming_exchange_in_conversation(
+    pub(crate) fn start_streaming_exchange_in_conversation(
         &mut self,
         terminal_view_id: EntityId,
         conversation_id: Option<AIConversationId>,
         prompt: String,
         working_directory: Option<String>,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<AcpStreamingExchangeHandle, UpdateHistoryError> {
+    ) -> Result<StreamingExchangeHandle, UpdateHistoryError> {
         let conversation_id = conversation_id
             .filter(|conversation_id| self.conversations_by_id.contains_key(conversation_id))
             .unwrap_or_else(|| self.start_new_conversation(terminal_view_id, false, false, ctx));
@@ -872,7 +872,7 @@ impl BlocklistAIHistoryModel {
             terminal_view_id,
             ctx,
         )?;
-        Ok(AcpStreamingExchangeHandle {
+        Ok(StreamingExchangeHandle {
             conversation_id,
             exchange_id,
             message_id,
@@ -880,10 +880,10 @@ impl BlocklistAIHistoryModel {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn update_acp_streaming_exchange(
+    pub(crate) fn update_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,
-        handle: &AcpStreamingExchangeHandle,
+        handle: &StreamingExchangeHandle,
         output_text: String,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
@@ -903,10 +903,10 @@ impl BlocklistAIHistoryModel {
         Ok(())
     }
 
-    pub(crate) fn update_acp_streaming_exchange_output(
+    pub(crate) fn update_streaming_exchange_output(
         &mut self,
         terminal_view_id: EntityId,
-        handle: &AcpStreamingExchangeHandle,
+        handle: &StreamingExchangeHandle,
         output: AIAgentOutput,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
@@ -926,14 +926,14 @@ impl BlocklistAIHistoryModel {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn finish_acp_streaming_exchange(
+    pub(crate) fn finish_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,
-        handle: &AcpStreamingExchangeHandle,
+        handle: &StreamingExchangeHandle,
         output_text: String,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
-        self.update_acp_streaming_exchange(terminal_view_id, handle, output_text, ctx)?;
+        self.update_streaming_exchange(terminal_view_id, handle, output_text, ctx)?;
         let conversation = self
             .conversations_by_id
             .get_mut(&handle.conversation_id)
@@ -944,10 +944,10 @@ impl BlocklistAIHistoryModel {
         Ok(())
     }
 
-    pub(crate) fn finish_acp_streaming_exchange_current_output(
+    pub(crate) fn finish_streaming_exchange_current_output(
         &mut self,
         terminal_view_id: EntityId,
-        handle: &AcpStreamingExchangeHandle,
+        handle: &StreamingExchangeHandle,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
         let conversation = self
@@ -960,7 +960,7 @@ impl BlocklistAIHistoryModel {
         Ok(())
     }
 
-    pub fn append_finished_acp_exchange(
+    pub fn append_finished_text_exchange(
         &mut self,
         terminal_view_id: EntityId,
         prompt: String,

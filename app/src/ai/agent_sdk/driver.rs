@@ -1689,7 +1689,7 @@ impl AgentDriver {
         let stream_handle = foreground
             .spawn(move |_, ctx| {
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.start_acp_streaming_exchange(
+                    history.start_streaming_exchange(
                         terminal_view_id,
                         prompt_for_history,
                         Some(working_dir_for_history.display().to_string()),
@@ -1771,7 +1771,7 @@ impl AgentDriver {
                         foreground
                             .spawn(move |_, ctx| {
                                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                                    history.update_acp_streaming_exchange_output(
+                                    history.update_streaming_exchange_output(
                                         terminal_view_id,
                                         &handle,
                                         output,
@@ -1796,7 +1796,7 @@ impl AgentDriver {
             foreground
                 .spawn(move |_, ctx| {
                     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                        history.update_acp_streaming_exchange_output(
+                        history.update_streaming_exchange_output(
                             terminal_view_id,
                             &handle,
                             output,
@@ -1818,13 +1818,13 @@ impl AgentDriver {
         foreground
             .spawn(move |_, ctx| {
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.update_acp_streaming_exchange_output(
+                    history.update_streaming_exchange_output(
                         terminal_view_id,
                         &stream_handle,
                         final_output,
                         ctx,
                     )?;
-                    history.finish_acp_streaming_exchange_current_output(
+                    history.finish_streaming_exchange_current_output(
                         terminal_view_id,
                         &stream_handle,
                         ctx,

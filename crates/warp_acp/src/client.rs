@@ -33,7 +33,9 @@ const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub enum AcpClientError {
     #[error(transparent)]
     Transport(#[from] JsonRpcTransportError),
-    #[error("ACP agent selected unsupported protocol version {agent_version}; client supports {client_version}")]
+    #[error(
+        "ACP agent selected unsupported protocol version {agent_version}; client supports {client_version}"
+    )]
     UnsupportedProtocolVersion {
         client_version: u16,
         agent_version: u16,

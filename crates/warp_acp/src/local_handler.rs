@@ -90,6 +90,14 @@ pub struct LocalClientRequestHandler {
 }
 
 pub trait ClientRequestUi: Send + Sync {
+    fn approve_read_text_file(
+        &self,
+        _request: &ReadTextFileRequest,
+        _resolved_path: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(true)
+    }
+
     fn approve_write_text_file(
         &self,
         _request: &WriteTextFileRequest,
@@ -204,6 +212,11 @@ impl LocalClientRequestHandler {
         }
         let request: ReadTextFileRequest = serde_json::from_value(params)?;
         let path = self.resolve_workspace_path(&request.path, true)?;
+        if !self.ui.approve_read_text_file(&request, &path)? {
+            return Err(LocalClientRequestError::PermissionDenied(
+                "fs/read_text_file",
+            ));
+        }
         let content = fs::read_to_string(path)?;
         Ok(ReadTextFileResponse {
             content: slice_lines(&content, request.line, request.limit),
@@ -645,11 +658,22 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingUi {
+        reads: Arc<Mutex<Vec<PathBuf>>>,
         writes: Arc<Mutex<Vec<PathBuf>>>,
+        allow_read: bool,
         allow_write: bool,
     }
 
     impl ClientRequestUi for RecordingUi {
+        fn approve_read_text_file(
+            &self,
+            _request: &ReadTextFileRequest,
+            resolved_path: &Path,
+        ) -> Result<bool, LocalClientRequestError> {
+            self.reads.lock().unwrap().push(resolved_path.to_path_buf());
+            Ok(self.allow_read)
+        }
+
         fn approve_write_text_file(
             &self,
             _request: &WriteTextFileRequest,
@@ -671,10 +695,59 @@ mod tests {
     }
 
     #[test]
+    fn read_request_waits_for_ui_decision() {
+        let dir = temp_dir();
+        let file = dir.join("readable.txt");
+        fs::write(&file, "secret").unwrap();
+        let ui = Arc::new(RecordingUi {
+            reads: Arc::new(Mutex::new(Vec::new())),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            allow_read: false,
+            allow_write: true,
+        });
+        let reads = Arc::clone(&ui.reads);
+        let mut handler = LocalClientRequestHandler::new(LocalClientRequestPolicy {
+            workspace_root: dir.clone(),
+            allow_read_text_file: true,
+            allow_write_text_file: false,
+            allow_terminal: false,
+            allow_permission_selection: false,
+        })
+        .unwrap()
+        .with_ui(ui);
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(Cursor::new(Vec::new()), writer, None);
+
+        handler
+            .handle(
+                AgentMessage::Request {
+                    id: JsonRpcId::Number(11),
+                    method: "fs/read_text_file".to_string(),
+                    params: json!({"sessionId":"s","path":"readable.txt"}),
+                },
+                &transport,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[file.canonicalize().unwrap()]
+        );
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains(r#""id":11"#));
+        assert!(written.contains(r#""code":-32002"#));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn write_request_waits_for_ui_decision() {
         let dir = temp_dir();
         let ui = Arc::new(RecordingUi {
+            reads: Arc::new(Mutex::new(Vec::new())),
             writes: Arc::new(Mutex::new(Vec::new())),
+            allow_read: true,
             allow_write: false,
         });
         let writes = Arc::clone(&ui.writes);

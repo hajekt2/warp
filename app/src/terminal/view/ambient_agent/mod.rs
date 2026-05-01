@@ -4,6 +4,7 @@ mod footer;
 mod harness_selector;
 mod host_selector;
 mod loading_screen;
+mod local_acp;
 mod model;
 mod model_selector;
 mod progress;
