@@ -102,6 +102,7 @@ use crate::code_review::context::{
 #[cfg(feature = "local_fs")]
 use crate::code_review::DiffSetScope;
 use crate::terminal::model::blocks::RemovableBlocklistItem;
+use crate::terminal::model::terminal_model::ConversationTranscriptViewerStatus;
 #[cfg(feature = "local_fs")]
 use crate::util::file::external_editor::{settings::EditorLayout, EditorSettings};
 use crate::util::truncation::truncate_from_end;
@@ -6525,11 +6526,19 @@ impl TerminalView {
     /// Returns whether or not the active session is a local session.  Returns
     /// None if there is no active session.
     pub fn active_session_is_local<C: ModelAsRef>(&self, ctx: &C) -> Option<bool> {
-        // Ensure shared session viewers and conversation transcript viewers are not
-        // considered local, even if the session hasn't been joined yet.
+        // Ensure shared session viewers are not considered local, even if the session hasn't
+        // been joined yet. Conversation transcript viewers can be local or remote: local ACP /
+        // CLI-agent history should keep access to local workspace UI, while cloud ambient-agent
+        // transcripts remain remote-gated.
         let model = self.model.lock();
-        if model.is_shared_session_viewer() || model.is_conversation_transcript_viewer() {
+        if model.is_shared_session_viewer() {
             return Some(false);
+        }
+        if let Some(status) = model.conversation_transcript_viewer_status() {
+            return Some(matches!(
+                status,
+                ConversationTranscriptViewerStatus::ViewingLocalConversation
+            ));
         }
         drop(model);
 

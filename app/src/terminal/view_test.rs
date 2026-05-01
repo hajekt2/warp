@@ -54,7 +54,7 @@ use crate::view_components::find::FindWithinBlockState;
 use crate::terminal::model::ansi::{self, InitShellValue};
 use crate::terminal::model::ansi::{BootstrappedValue, PreexecValue};
 use crate::terminal::model::blocks::{insert_block, TotalIndex};
-use crate::terminal::model::terminal_model::WithinBlock;
+use crate::terminal::model::terminal_model::{ConversationTranscriptViewerStatus, WithinBlock};
 
 use crate::terminal::{MockTerminalManager, TerminalManager, TerminalModel};
 use crate::test_util::terminal::initialize_app_for_terminal_view;
@@ -2501,6 +2501,75 @@ fn test_alt_scroll_sequences() {
                     .filter(|b| *b == escape_sequences::EscCodes::ARROW_UP)
                     .count(),
                 5
+            );
+        });
+    })
+}
+
+#[test]
+fn local_conversation_transcript_keeps_project_explorer_enabled() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_conversation_transcript_viewer_status(Some(
+                    ConversationTranscriptViewerStatus::ViewingLocalConversation,
+                ));
+
+            let is_local = view.active_session_is_local(ctx);
+            assert_eq!(is_local, Some(true));
+
+            let enablement =
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::from_session_env(
+                    true,
+                    matches!(is_local, Some(false)),
+                    false,
+                    false,
+                );
+            assert_eq!(
+                enablement,
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::Enabled
+            );
+        });
+    })
+}
+
+#[test]
+fn ambient_conversation_transcript_keeps_project_explorer_remote_gated() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            let task_id =
+                <crate::ai::ambient_agents::AmbientAgentTaskId as std::str::FromStr>::from_str(
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+                .unwrap();
+            view.model
+                .lock()
+                .set_conversation_transcript_viewer_status(Some(
+                    ConversationTranscriptViewerStatus::ViewingAmbientConversation(task_id),
+                ));
+
+            let is_local = view.active_session_is_local(ctx);
+            assert_eq!(is_local, Some(false));
+
+            let enablement =
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::from_session_env(
+                    true,
+                    matches!(is_local, Some(false)),
+                    false,
+                    false,
+                );
+            assert_eq!(
+                enablement,
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::RemoteSession {
+                    has_remote_server: false,
+                }
             );
         });
     })
