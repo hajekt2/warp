@@ -530,16 +530,10 @@ mod tests {
 
     #[test]
     fn prompt_round_trips_response() {
-        let input = Cursor::new(
+        let (client, _) = client_with_response(
             br#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}
-"#
-            .to_vec(),
+"#,
         );
-        let client = AcpClient::new(JsonRpcStdioTransport::from_reader_writer(
-            input,
-            SharedWriter::default(),
-            None,
-        ));
 
         let response = client
             .prompt(SessionId::new("s1"), vec![ContentBlock::text("hello")])

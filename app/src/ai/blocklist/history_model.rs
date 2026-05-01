@@ -479,6 +479,7 @@ impl BlocklistAIHistoryModel {
         conversation.write_updated_conversation_state(ctx);
     }
 
+    #[doc(hidden)]
     /// Returns persisted ACP session metadata for a live conversation, if present.
     pub fn acp_session_resume_metadata(
         &self,
@@ -489,6 +490,7 @@ impl BlocklistAIHistoryModel {
             .and_then(|conversation| conversation.acp_session_resume().cloned())
     }
 
+    #[doc(hidden)]
     /// Updates the ACP session metadata stored alongside the conversation and
     /// writes it through the normal conversation persistence path.
     pub fn set_acp_session_resume_metadata(
@@ -825,6 +827,14 @@ impl BlocklistAIHistoryModel {
         new_conversation_id
     }
 
+    // Streaming exchange API boundary:
+    //
+    // Keep these methods transport-agnostic. They exist for agent runtimes that
+    // emit incremental output before the final exchange is known (currently the
+    // agent SDK driver and local ACP's `session/update` notifications). Cloud
+    // Oz conversations that arrive as complete exchanges should continue to use
+    // the normal append-exchange path instead of extending this section with
+    // transport-specific entry points.
     pub(crate) fn start_streaming_exchange(
         &mut self,
         terminal_view_id: EntityId,

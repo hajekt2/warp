@@ -803,6 +803,341 @@ done
 }
 
 #[test]
+fn configured_acp_agent_reuses_session_across_two_prompts() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-stateful-agent-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-stateful-agent-{}-{fixture_nonce}.log",
+            std::process::id(),
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "start pid=$$" >> "$log_path"
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"stateful-fixture","version":"test"}},"authMethods":[]}}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stateful-fixture-session"}}}}'
+prompt_id=3
+last_prompt=''
+while IFS= read -r line; do
+  case "$line" in
+    *first*) current='first' ;;
+    *second*) current='second' ;;
+    *) current='unknown' ;;
+  esac
+  if [ -n "$last_prompt" ]; then
+    output="prior:$last_prompt;current:$current"
+  else
+    output="current:$current"
+  fi
+  printf '%s\n' "prompt:$current pid=$$" >> "$log_path"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"stateful-fixture-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+  last_prompt="$current"
+done
+"#,
+                log_path = log_path.display(),
+            ),
+        )
+        .expect("write ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Stateful ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("stateful-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("first", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("current:first")
+            }),
+            "first ACP prompt should complete"
+        );
+
+        let first_conversation_id = terminal.read(&app, |view, ctx| {
+            BlocklistAIHistoryModel::as_ref(ctx)
+                .active_conversation(view.view_id)
+                .expect("first prompt should create a conversation")
+                .id()
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("second", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                conversation.id() == first_conversation_id
+                    && conversation.exchange_count() == 2
+                    && exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("prior:first;current:second")
+            }),
+            "second ACP prompt should reuse the same process/session and see turn-one context"
+        );
+
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("start pid=").count(),
+            1,
+            "two prompts should use one ACP subprocess; log:\n{fixture_log}"
+        );
+
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
+    });
+}
+
+#[test]
+fn configured_acp_agent_reset_on_command_change() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-{}-{fixture_nonce}.log",
+            std::process::id(),
+        ));
+        let script_a = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-a-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+        let script_b = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-b-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+
+        for (script_path, label) in [(&script_a, "a"), (&script_b, "b")] {
+            fs::write(
+                script_path,
+                format!(
+                    r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "start:{label} pid=$$" >> "$log_path"
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"command-change-fixture","version":"{label}"}},"authMethods":[]}}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"command-change-{label}"}}}}'
+prompt_id=3
+last_prompt=''
+while IFS= read -r line; do
+  case "$line" in
+    *first*) current='first' ;;
+    *second*) current='second' ;;
+    *) current='unknown' ;;
+  esac
+  if [ -n "$last_prompt" ]; then
+    output="prior:$last_prompt;current:$current;agent:{label}"
+  else
+    output="current:$current;agent:{label}"
+  fi
+  printf '%s\n' "prompt:$current:{label} pid=$$" >> "$log_path"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"command-change-{label}\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+  last_prompt="$current"
+done
+"#,
+                    log_path = log_path.display(),
+                ),
+            )
+            .expect("write ACP fixture");
+        }
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Command Change ACP",
+                "sh",
+                vec![script_a.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new(
+                            "command-change-acp",
+                        )),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("first", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("current:first;agent:a")
+            }),
+            "first ACP prompt should complete on command A"
+        );
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.upsert_acp_agent_config(
+                crate::settings::AcpAgentConfig {
+                    id: AcpAgentId::new("command-change-acp"),
+                    name: "Command Change ACP".to_string(),
+                    command: "sh".to_string(),
+                    transport: crate::settings::AcpAgentTransportConfig::Local,
+                    args: vec![script_b.display().to_string()],
+                    env: Vec::new(),
+                    mcp_allowlist: Vec::new(),
+                    install_url: None,
+                    registry_key: None,
+                    local_confirmation: crate::settings::AcpAgentLocalConfirmation {
+                        confirmed_on_this_device: true,
+                        confirmed_at: None,
+                    },
+                },
+                ctx,
+            );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("second", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                let output = exchange.format_output_for_copy(None);
+                conversation.exchange_count() == 2
+                    && exchange.output_status.is_finished_and_successful()
+                    && output.contains("current:second;agent:b")
+                    && !output.contains("prior:first")
+            }),
+            "changing the ACP command should clear the old runtime session and start a fresh process"
+        );
+
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("start:").count(),
+            2,
+            "command change should spawn a new ACP subprocess; log:\n{fixture_log}"
+        );
+        assert!(fixture_log.contains("start:a"));
+        assert!(fixture_log.contains("start:b"));
+
+        let _ = fs::remove_file(script_a);
+        let _ = fs::remove_file(script_b);
+        let _ = fs::remove_file(log_path);
+    });
+}
+
+#[test]
 fn enter_surfaces_configured_acp_agent_failure_in_agent_history() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);

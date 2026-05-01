@@ -848,11 +848,20 @@ pub struct AcpEnvironmentEntry {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpHttpHeader {
     pub name: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for AcpHttpHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpHttpHeader")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

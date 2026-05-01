@@ -4,6 +4,7 @@
 //! UX, as well as small UX configurations.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -27,6 +28,7 @@ use settings::{
 };
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
+use warpui_extras::secure_storage::{self, AppContextExt as _};
 
 use serde::{de::Deserializer, Deserialize, Serialize};
 use strum::IntoEnumIterator;
@@ -792,7 +794,6 @@ pub struct AcpAgentEnvVar {
 
 /// One HTTP header for a remote ACP transport.
 #[derive(
-    Debug,
     Clone,
     PartialEq,
     Eq,
@@ -805,6 +806,25 @@ pub struct AcpAgentEnvVar {
 pub struct AcpAgentHttpHeader {
     pub name: String,
     pub value: AcpAgentEnvValue,
+}
+
+impl fmt::Debug for AcpAgentHttpHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcpAgentHttpHeader")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AcpAgentConnectionError {
+    #[error("ACP agent secret header `{key}` is missing; configure missing secret: {key}")]
+    MissingSecret { key: String },
+    #[error(transparent)]
+    SecureStorage(#[from] secure_storage::Error),
+    #[error(transparent)]
+    Config(#[from] anyhow::Error),
 }
 
 /// Transport used to reach an ACP agent. Local stdio remains the default for
@@ -930,7 +950,10 @@ impl AcpAgentConfig {
         Ok(command)
     }
 
-    pub fn to_agent_connection(&self) -> anyhow::Result<warp_acp::AcpAgentConnection> {
+    pub fn to_agent_connection(
+        &self,
+        ctx: &AppContext,
+    ) -> Result<warp_acp::AcpAgentConnection, AcpAgentConnectionError> {
         match &self.transport {
             AcpAgentTransportConfig::Local => Ok(warp_acp::AcpAgentConnection::stdio(
                 self.to_launch_command()?,
@@ -938,13 +961,13 @@ impl AcpAgentConfig {
             AcpAgentTransportConfig::Http { url, headers } => {
                 Ok(warp_acp::AcpAgentConnection::http(
                     warp_acp::AcpRemoteEndpoint::new(url.clone())
-                        .headers(materialize_acp_headers(headers, &self.name)?),
+                        .headers(materialize_acp_headers(headers, ctx.secure_storage())?),
                 ))
             }
             AcpAgentTransportConfig::WebSocket { url, headers } => {
                 Ok(warp_acp::AcpAgentConnection::websocket(
                     warp_acp::AcpRemoteEndpoint::new(url.clone())
-                        .headers(materialize_acp_headers(headers, &self.name)?),
+                        .headers(materialize_acp_headers(headers, ctx.secure_storage())?),
                 ))
             }
         }
@@ -973,19 +996,20 @@ impl AcpAgentConfig {
 
 fn materialize_acp_headers(
     headers: &[AcpAgentHttpHeader],
-    agent_name: &str,
-) -> anyhow::Result<Vec<warp_acp::AcpHttpHeader>> {
+    secure_storage: &dyn secure_storage::SecureStorage,
+) -> Result<Vec<warp_acp::AcpHttpHeader>, AcpAgentConnectionError> {
     headers
         .iter()
         .map(|header| {
             let value = match &header.value {
                 AcpAgentEnvValue::Literal { value } => value.clone(),
-                AcpAgentEnvValue::SecretRef { key } => {
-                    anyhow::bail!(
-                        "ACP agent '{agent_name}' references secret header '{}', but ACP secret materialization is not wired yet",
-                        key
-                    );
-                }
+                AcpAgentEnvValue::SecretRef { key } => match secure_storage.read_value(key) {
+                    Ok(value) => value,
+                    Err(secure_storage::Error::NotFound) => {
+                        return Err(AcpAgentConnectionError::MissingSecret { key: key.clone() });
+                    }
+                    Err(error) => return Err(error.into()),
+                },
             };
             Ok(warp_acp::AcpHttpHeader {
                 name: header.name.clone(),

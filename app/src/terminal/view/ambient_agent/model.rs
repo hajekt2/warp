@@ -563,7 +563,7 @@ impl AmbientAgentViewModel {
             }
         }
 
-        let connection = match config.to_agent_connection() {
+        let connection = match config.to_agent_connection(ctx) {
             Ok(command) => command,
             Err(error) => {
                 self.handle_spawn_error(error.to_string(), ctx);
@@ -601,6 +601,9 @@ impl AmbientAgentViewModel {
             &working_dir,
             &request_policy,
         );
+        if existing_acp_session.is_none() {
+            self.local_acp_agent.clear_runtime_session();
+        }
         let persisted_acp_session = existing_acp_session
             .is_none()
             .then(|| {

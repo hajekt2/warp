@@ -271,6 +271,10 @@ impl LocalAcpAgentModel {
             .cloned()
     }
 
+    pub(super) fn clear_runtime_session(&mut self) {
+        self.runtime_session = None;
+    }
+
     pub(super) fn mark_prompting(&mut self) {
         self.status = LocalAcpAgentStatus::Prompting;
     }

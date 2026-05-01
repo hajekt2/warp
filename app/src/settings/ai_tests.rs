@@ -4,6 +4,7 @@ use crate::{
     test_util::settings::initialize_settings_for_tests,
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::{App, SingletonEntity};
 
@@ -401,6 +402,140 @@ fn test_acp_agent_config_roundtrip() {
     let file_value = original.to_file_value();
     let restored = AcpAgentConfig::from_file_value(&file_value).unwrap();
     assert_eq!(original, restored);
+}
+
+#[derive(Default)]
+struct TestSecureStorage {
+    values: HashMap<String, String>,
+}
+
+impl TestSecureStorage {
+    fn new(values: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+        Self {
+            values: values
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+}
+
+impl warpui_extras::secure_storage::SecureStorage for TestSecureStorage {
+    fn write_value(
+        &self,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), warpui_extras::secure_storage::Error> {
+        Ok(())
+    }
+
+    fn read_value(&self, key: &str) -> Result<String, warpui_extras::secure_storage::Error> {
+        self.values
+            .get(key)
+            .cloned()
+            .ok_or(warpui_extras::secure_storage::Error::NotFound)
+    }
+
+    fn remove_value(&self, _key: &str) -> Result<(), warpui_extras::secure_storage::Error> {
+        Ok(())
+    }
+}
+
+fn remote_acp_config_with_header(header: AcpAgentHttpHeader) -> AcpAgentConfig {
+    AcpAgentConfig {
+        id: AcpAgentId::new("remote-agent"),
+        name: "Remote Agent".to_string(),
+        command: String::new(),
+        transport: AcpAgentTransportConfig::Http {
+            url: "https://remote.example/acp".to_string(),
+            headers: vec![header],
+        },
+        args: Vec::new(),
+        env: Vec::new(),
+        mcp_allowlist: Vec::new(),
+        install_url: None,
+        registry_key: None,
+        local_confirmation: AcpAgentLocalConfirmation::default(),
+    }
+}
+
+#[test]
+fn to_agent_connection_resolves_secret_ref_headers() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| -> warpui_extras::secure_storage::Model {
+                Box::new(TestSecureStorage::new([(
+                    "my-token",
+                    "Bearer resolved-token",
+                )]))
+            });
+        });
+
+        let config = remote_acp_config_with_header(AcpAgentHttpHeader {
+            name: "Authorization".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "my-token".to_string(),
+            },
+        });
+
+        app.read(|ctx| {
+            let connection = config
+                .to_agent_connection(ctx)
+                .expect("secret header should materialize");
+            let warp_acp::AcpAgentConnection::Http { endpoint } = connection else {
+                panic!("expected HTTP ACP connection");
+            };
+            assert_eq!(endpoint.headers.len(), 1);
+            assert_eq!(endpoint.headers[0].name, "Authorization");
+            assert_eq!(endpoint.headers[0].value, "Bearer resolved-token");
+        });
+    });
+}
+
+#[test]
+fn to_agent_connection_returns_missing_secret_error() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| -> warpui_extras::secure_storage::Model {
+                Box::new(TestSecureStorage::default())
+            });
+        });
+
+        let config = remote_acp_config_with_header(AcpAgentHttpHeader {
+            name: "Authorization".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "missing-token".to_string(),
+            },
+        });
+
+        app.read(|ctx| {
+            let error = config
+                .to_agent_connection(ctx)
+                .expect_err("missing secret should return structured error");
+            assert!(matches!(
+                error,
+                AcpAgentConnectionError::MissingSecret { ref key } if key == "missing-token"
+            ));
+            assert!(error
+                .to_string()
+                .contains("configure missing secret: missing-token"));
+        });
+    });
+}
+
+#[test]
+fn acp_agent_http_header_debug_redacts_secret_values() {
+    let header = AcpAgentHttpHeader {
+        name: "Authorization".to_string(),
+        value: AcpAgentEnvValue::Literal {
+            value: "Bearer literal-token".to_string(),
+        },
+    };
+
+    let debug = format!("{header:?}");
+    assert!(debug.contains("Authorization"));
+    assert!(!debug.contains("literal-token"));
+    assert!(debug.contains("<redacted>"));
 }
 
 #[test]
