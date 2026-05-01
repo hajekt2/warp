@@ -624,37 +624,51 @@ fn enter_runs_configured_acp_agent_without_calling_interactive_auth() {
         let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
         let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
 
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
         let script_path = std::env::temp_dir().join(format!(
-            "warp-acp-login-agent-{}-{}.sh",
+            "warp-acp-login-agent-{}-{fixture_nonce}.sh",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-login-agent-{}-{fixture_nonce}.log",
+            std::process::id(),
         ));
         fs::write(
             &script_path,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "initialize pid=$$" >> "$log_path"
 IFS= read -r line || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"login-fixture","version":"test"},"authMethods":[{"id":"opencode-login","name":"Login with opencode","description":"Run `opencode auth login` in the terminal"}]}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"login-fixture","version":"test"}},"authMethods":[{{"id":"opencode-login","name":"Login with opencode","description":"Run `opencode auth login` in the terminal"}}]}}}}'
 IFS= read -r line || exit 1
 case "$line" in
   *'"method":"authenticate"'*)
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"authenticate should not be called for interactive login methods"}}'
+    printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32603,"message":"authenticate should not be called for interactive login methods"}}}}'
     exit 0
     ;;
 esac
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"login-fixture-session"}}'
-IFS= read -r line || exit 1
-case "$line" in
-  *again*) output='echo: again' ;;
-  *) output='echo: test' ;;
-esac
-printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"login-fixture-session\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"$output\"}}}}"
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-IFS= read -r line || exit 0
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
+printf '%s\n' "new_session pid=$$" >> "$log_path"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"login-fixture-session"}}}}'
+prompt_id=3
+prompt_count=0
+while IFS= read -r line; do
+  prompt_count=$((prompt_count + 1))
+  printf '%s\n' "prompt $prompt_count pid=$$" >> "$log_path"
+  case "$line" in
+    *again*) output="echo: again after $prompt_count prompts" ;;
+    *) output="echo: test after $prompt_count prompts" ;;
+  esac
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"login-fixture-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+done
 "#,
+                log_path = log_path.display(),
+            ),
         )
         .expect("write ACP fixture");
 
@@ -691,8 +705,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 
         assert_eventually!(
             terminal.read(&app, |view, ctx| {
-                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
-                    .active_conversation(view.view_id)
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
                 else {
                     return false;
                 };
@@ -704,8 +718,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 
         assert_eventually!(
             terminal.read(&app, |view, ctx| {
-                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
-                    .active_conversation(view.view_id)
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
                 else {
                     return false;
                 };
@@ -724,7 +738,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
                     && view.agent_view_controller().as_ref(ctx).is_active()
                     && has_visible_agent_view_ai_block
                     && exchange.output_status.is_finished_and_successful()
-                    && exchange.format_output_for_copy(None).contains("echo: test")
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("echo: test after 1 prompts")
             }),
             "configured ACP login fixture should finish the submit loop, keep the AI block visible in agent view, and stream output instead of calling authenticate"
         );
@@ -744,8 +760,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 
         assert_eventually!(
             terminal.read(&app, |view, ctx| {
-                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
-                    .active_conversation(view.view_id)
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
                 else {
                     return false;
                 };
@@ -757,12 +773,32 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
                     && view.active_conversation_id(ctx) == Some(first_conversation_id)
                     && view.agent_view_controller().as_ref(ctx).is_active()
                     && exchange.output_status.is_finished_and_successful()
-                    && exchange.format_output_for_copy(None).contains("echo: again")
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("echo: again after 2 prompts")
             }),
             "configured ACP follow-up should append to the existing local ACP conversation instead of replacing history"
         );
 
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("initialize").count(),
+            1,
+            "ACP follow-up should reuse the initialized subprocess; log:\n{fixture_log}"
+        );
+        assert_eq!(
+            fixture_log.matches("new_session").count(),
+            1,
+            "ACP follow-up should reuse the initialized session; log:\n{fixture_log}"
+        );
+        assert_eq!(
+            fixture_log.matches("prompt ").count(),
+            2,
+            "fixture should receive both prompts on one session; log:\n{fixture_log}"
+        );
+
         let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
     });
 }
 
@@ -832,8 +868,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom fr
 
         assert_eventually!(
             terminal.read(&app, |view, ctx| {
-                let Some(conversation) = BlocklistAIHistoryModel::as_ref(ctx)
-                    .active_conversation(view.view_id)
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
                 else {
                     return false;
                 };

@@ -199,6 +199,22 @@ impl JsonRpcStdioTransport {
         let started_at = Instant::now();
         loop {
             self.drain_agent_messages(&mut handle_agent_message)?;
+            match rx.try_recv() {
+                Ok(Ok(value)) => {
+                    self.drain_agent_messages(&mut handle_agent_message)?;
+                    return serde_json::from_value(value).map_err(JsonRpcTransportError::Decode);
+                }
+                Ok(Err(error)) => {
+                    self.drain_agent_messages(&mut handle_agent_message)?;
+                    return Err(JsonRpcTransportError::RemoteError {
+                        code: error.code,
+                        message: error.message,
+                        data: error.data,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => return Err(JsonRpcTransportError::Closed),
+            }
             if self.closed.load(Ordering::Relaxed) {
                 self.pending.lock().expect("pending poisoned").remove(&id);
                 return Err(JsonRpcTransportError::Closed);
@@ -227,7 +243,7 @@ impl JsonRpcStdioTransport {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(JsonRpcTransportError::Closed)
+                    return Err(JsonRpcTransportError::Closed);
                 }
             }
         }

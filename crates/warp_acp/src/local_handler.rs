@@ -23,7 +23,7 @@ const ERROR_PERMISSION_DENIED: i64 = -32002;
 const ERROR_INVALID_PARAMS: i64 = -32602;
 const ERROR_INTERNAL: i64 = -32603;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalClientRequestPolicy {
     pub workspace_root: PathBuf,
     pub allow_read_text_file: bool,
