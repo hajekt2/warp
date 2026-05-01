@@ -21,7 +21,10 @@ use crate::cloud_object::JsonObjectType;
 use crate::cloud_object::ObjectType;
 
 use crate::editor::{EditorOptions, InteractionState, SingleLineEditorOptions, TextColors};
-use crate::settings::ai::{AcpAgentConfig, AcpAgentEnvValue, AcpAgentEnvVar, AcpAgentId};
+use crate::settings::ai::{
+    AcpAgentConfig, AcpAgentEnvValue, AcpAgentEnvVar, AcpAgentHttpHeader, AcpAgentId,
+    AcpAgentTransportConfig,
+};
 use crate::settings::InputSettings;
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
@@ -1360,7 +1363,7 @@ impl AISettingsPageView {
         let acp_agent_custom_editor = ctx.add_typed_action_view(|ctx| {
             let mut input = SubmittableTextInput::new(ctx)
                 .validate_on_submit(|s| parse_acp_agent_input(s).is_some());
-            input.set_placeholder_text("Name | command arg1 arg2 OR id | Name | command args | env KEY=value | mcp server-id", ctx);
+            input.set_placeholder_text("Name | command args  ·  Name | http https://host/acp  ·  id | Name | ws wss://host/acp | header Authorization=secret:TOKEN", ctx);
             input
         });
         ctx.subscribe_to_view(&acp_agent_custom_editor, |_, _, event, ctx| {
@@ -1370,9 +1373,12 @@ impl AISettingsPageView {
                         ParsedAcpAgentInput::Add {
                             name,
                             command,
+                            transport,
                             args,
                         } => {
-                            settings.add_custom_acp_agent_config(&name, &command, args, ctx);
+                            settings.add_custom_acp_agent_config_with_transport(
+                                &name, &command, args, transport, ctx,
+                            );
                         }
                         ParsedAcpAgentInput::Upsert(config) => {
                             settings.upsert_acp_agent_config(config, ctx);
@@ -6083,6 +6089,7 @@ enum ParsedAcpAgentInput {
     Add {
         name: String,
         command: String,
+        transport: AcpAgentTransportConfig,
         args: Vec<String>,
     },
     Upsert(AcpAgentConfig),
@@ -6097,19 +6104,21 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
 
     match parts.as_slice() {
         [name, argv] => {
-            let (command, args) = parse_acp_argv(argv)?;
+            let (command, args, transport) = parse_acp_target(argv)?;
             Some(ParsedAcpAgentInput::Add {
                 name: (*name).to_string(),
                 command,
+                transport,
                 args,
             })
         }
         [id, name, argv, directives @ ..] => {
-            let (command, args) = parse_acp_argv(argv)?;
+            let (command, args, transport) = parse_acp_target(argv)?;
             let mut config = AcpAgentConfig {
                 id: AcpAgentId::new(*id),
                 name: (*name).to_string(),
                 command,
+                transport,
                 args,
                 env: Vec::new(),
                 mcp_allowlist: Vec::new(),
@@ -6137,6 +6146,12 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
                     "registry" | "registry_key" => {
                         config.registry_key = (!value.is_empty()).then(|| value.to_string());
                     }
+                    "header" | "headers" => {
+                        set_acp_transport_headers(
+                            &mut config.transport,
+                            parse_acp_header_directive(value)?,
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -6150,10 +6165,50 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
     }
 }
 
-fn parse_acp_argv(argv: &str) -> Option<(String, Vec<String>)> {
-    let argv = shell_words::split(argv.trim()).ok()?;
-    let (command, args) = argv.split_first()?;
-    Some((command.clone(), args.to_vec()))
+fn parse_acp_target(target: &str) -> Option<(String, Vec<String>, AcpAgentTransportConfig)> {
+    let argv = shell_words::split(target.trim()).ok()?;
+    let (head, rest) = argv.split_first()?;
+    match head.to_ascii_lowercase().as_str() {
+        "http" | "https" => {
+            let url = rest.first()?.clone();
+            Some((
+                String::new(),
+                Vec::new(),
+                AcpAgentTransportConfig::Http {
+                    url,
+                    headers: Vec::new(),
+                },
+            ))
+        }
+        "ws" | "wss" | "websocket" => {
+            let url = rest.first()?.clone();
+            Some((
+                String::new(),
+                Vec::new(),
+                AcpAgentTransportConfig::WebSocket {
+                    url,
+                    headers: Vec::new(),
+                },
+            ))
+        }
+        _ if head.starts_with("http://") || head.starts_with("https://") => Some((
+            String::new(),
+            Vec::new(),
+            AcpAgentTransportConfig::Http {
+                url: head.clone(),
+                headers: Vec::new(),
+            },
+        )),
+        _ if head.starts_with("ws://") || head.starts_with("wss://") => Some((
+            String::new(),
+            Vec::new(),
+            AcpAgentTransportConfig::WebSocket {
+                url: head.clone(),
+                headers: Vec::new(),
+            },
+        )),
+        _ => Some((head.clone(), rest.to_vec(), AcpAgentTransportConfig::Local)),
+    }
 }
 
 fn parse_acp_env_directive(value: &str) -> Option<Vec<AcpAgentEnvVar>> {
@@ -6178,6 +6233,45 @@ fn parse_acp_env_directive(value: &str) -> Option<Vec<AcpAgentEnvVar>> {
         });
     }
     Some(env)
+}
+
+fn parse_acp_header_directive(value: &str) -> Option<Vec<AcpAgentHttpHeader>> {
+    let mut headers = Vec::new();
+    for token in shell_words::split(value).ok()? {
+        let (name, value) = token.split_once('=')?;
+        if name.is_empty() {
+            return None;
+        }
+        let value = if let Some(key) = value.strip_prefix("secret:") {
+            AcpAgentEnvValue::SecretRef {
+                key: key.to_string(),
+            }
+        } else {
+            AcpAgentEnvValue::Literal {
+                value: value.to_string(),
+            }
+        };
+        headers.push(AcpAgentHttpHeader {
+            name: name.to_string(),
+            value,
+        });
+    }
+    Some(headers)
+}
+
+fn set_acp_transport_headers(
+    transport: &mut AcpAgentTransportConfig,
+    headers: Vec<AcpAgentHttpHeader>,
+) {
+    match transport {
+        AcpAgentTransportConfig::Http {
+            headers: existing, ..
+        }
+        | AcpAgentTransportConfig::WebSocket {
+            headers: existing, ..
+        } => *existing = headers,
+        AcpAgentTransportConfig::Local => {}
+    }
 }
 
 fn parse_acp_list_directive(value: &str) -> Vec<String> {
@@ -7497,6 +7591,55 @@ mod styles {
                 .sub_text_color(appearance.theme().surface_1())
         } else {
             appearance.theme().disabled_ui_text_color()
+        }
+    }
+}
+
+#[cfg(test)]
+mod acp_agent_input_tests {
+    use super::*;
+
+    #[test]
+    fn parses_custom_http_acp_agent() {
+        let Some(ParsedAcpAgentInput::Add {
+            command,
+            transport,
+            args,
+            ..
+        }) = parse_acp_agent_input("Remote Codex | http https://agent.example.test/acp")
+        else {
+            panic!("expected custom remote ACP config");
+        };
+
+        assert!(command.is_empty());
+        assert!(args.is_empty());
+        assert!(matches!(
+            transport,
+            AcpAgentTransportConfig::Http { ref url, .. }
+                if url == "https://agent.example.test/acp"
+        ));
+    }
+
+    #[test]
+    fn parses_upsert_websocket_acp_agent_with_header() {
+        let Some(ParsedAcpAgentInput::Upsert(config)) = parse_acp_agent_input(
+            "remote-codex | Remote Codex | ws wss://agent.example.test/acp | header Authorization=secret:REMOTE_ACP_TOKEN",
+        ) else {
+            panic!("expected websocket ACP config");
+        };
+
+        match config.transport {
+            AcpAgentTransportConfig::WebSocket { url, headers } => {
+                assert_eq!(url, "wss://agent.example.test/acp");
+                assert_eq!(headers[0].name, "Authorization");
+                assert_eq!(
+                    headers[0].value,
+                    AcpAgentEnvValue::SecretRef {
+                        key: "REMOTE_ACP_TOKEN".to_string(),
+                    }
+                );
+            }
+            _ => panic!("expected websocket transport"),
         }
     }
 }

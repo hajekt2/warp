@@ -5,6 +5,70 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Remote ACP endpoint configuration. Headers are literal at this layer; callers
+/// are responsible for resolving any secret references before constructing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpRemoteEndpoint {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<crate::schema::AcpHttpHeader>,
+}
+
+impl AcpRemoteEndpoint {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn headers(
+        mut self,
+        headers: impl IntoIterator<Item = crate::schema::AcpHttpHeader>,
+    ) -> Self {
+        self.headers = headers.into_iter().collect();
+        self
+    }
+}
+
+/// Connection target for an ACP agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum AcpAgentConnection {
+    Stdio { command: AcpAgentCommand },
+    Http { endpoint: AcpRemoteEndpoint },
+    WebSocket { endpoint: AcpRemoteEndpoint },
+}
+
+impl AcpAgentConnection {
+    #[must_use]
+    pub fn stdio(command: AcpAgentCommand) -> Self {
+        Self::Stdio { command }
+    }
+
+    #[must_use]
+    pub fn http(endpoint: AcpRemoteEndpoint) -> Self {
+        Self::Http { endpoint }
+    }
+
+    #[must_use]
+    pub fn websocket(endpoint: AcpRemoteEndpoint) -> Self {
+        Self::WebSocket { endpoint }
+    }
+
+    #[must_use]
+    pub fn display_target(&self) -> Vec<String> {
+        match self {
+            Self::Stdio { command } => command.display_argv(),
+            Self::Http { endpoint } => vec!["http".to_string(), endpoint.url.clone()],
+            Self::WebSocket { endpoint } => vec!["websocket".to_string(), endpoint.url.clone()],
+        }
+    }
+}
+
 /// Environment variable configured for an ACP agent subprocess.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

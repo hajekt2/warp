@@ -40,6 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 respond(&mut stdout, id, json!({ "sessionId": "echo-session" }))?
             }
             "session/new" => respond_error(&mut stdout, id, -32004, "authentication required")?,
+            "session/load" if authenticated => {
+                let session_id = request["params"]["sessionId"]
+                    .as_str()
+                    .unwrap_or("echo-session");
+                respond(&mut stdout, id, json!({ "loadedSessionId": session_id }))?
+            }
+            "session/load" => respond_error(&mut stdout, id, -32004, "authentication required")?,
             "session/prompt" => {
                 let text = request["params"]["prompt"]
                     .as_array()

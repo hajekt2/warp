@@ -1005,6 +1005,19 @@ impl<'de> Deserialize<'de> for PersistedAutoexecuteMode {
         })
     }
 }
+/// Local ACP session data persisted with a conversation so Warp can ask an
+/// agent to reload the same protocol session after an app restart.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionResumeMetadata {
+    pub agent_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+}
+
 // Serializes to `conversation_data` column in `agent_conversations`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConversationData {
@@ -1041,6 +1054,8 @@ pub struct AgentConversationData {
     /// delivery without re-delivering already-processed events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_session_resume: Option<AcpSessionResumeMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1334,7 +1349,7 @@ pub struct NewMCPServerInstallation {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentConversationData;
+    use super::{AcpSessionResumeMetadata, AgentConversationData};
 
     #[test]
     fn agent_conversation_data_roundtrips_last_event_sequence() {
@@ -1350,10 +1365,45 @@ mod tests {
             run_id: None,
             autoexecute_override: None,
             last_event_sequence: Some(42),
+            acp_session_resume: None,
         };
         let json = serde_json::to_string(&data).expect("serialize");
         let roundtripped: AgentConversationData = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(roundtripped.last_event_sequence, Some(42));
+    }
+
+    #[test]
+    fn agent_conversation_data_roundtrips_acp_session_resume_metadata() {
+        let data = AgentConversationData {
+            server_conversation_token: None,
+            conversation_usage_metadata: None,
+            reverted_action_ids: None,
+            forked_from_server_conversation_token: None,
+            artifacts_json: None,
+            parent_agent_id: None,
+            agent_name: None,
+            parent_conversation_id: None,
+            run_id: None,
+            autoexecute_override: None,
+            last_event_sequence: None,
+            acp_session_resume: Some(AcpSessionResumeMetadata {
+                agent_id: "opencode".to_string(),
+                session_id: "ses_123".to_string(),
+                command_argv: vec!["opencode".to_string(), "acp".to_string()],
+                working_directory: Some("/tmp/work".to_string()),
+            }),
+        };
+
+        let json = serde_json::to_string(&data).expect("serialize");
+        let roundtripped: AgentConversationData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            roundtripped
+                .acp_session_resume
+                .as_ref()
+                .map(|m| m.session_id.as_str()),
+            Some("ses_123")
+        );
+        assert!(json.contains("acp_session_resume"));
     }
 
     #[test]
@@ -1380,6 +1430,7 @@ mod tests {
             run_id: None,
             autoexecute_override: None,
             last_event_sequence: None,
+            acp_session_resume: None,
         };
         let json = serde_json::to_string(&data).expect("serialize");
         assert!(

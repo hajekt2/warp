@@ -321,7 +321,7 @@ impl View for HarnessSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::ai::AcpAgentLocalConfirmation;
+    use crate::settings::ai::{AcpAgentLocalConfirmation, AcpAgentTransportConfig};
     use warpui::color::ColorU;
 
     fn configured_acp_agent(id: &str, name: &str) -> AcpAgentConfig {
@@ -329,6 +329,7 @@ mod tests {
             id: AcpAgentId::new(id),
             name: name.to_string(),
             command: "opencode".to_string(),
+            transport: AcpAgentTransportConfig::Local,
             args: vec!["acp".to_string(), "--port".to_string(), "0".to_string()],
             env: vec![],
             mcp_allowlist: vec![],

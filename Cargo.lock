@@ -14470,11 +14470,16 @@ name = "warp_acp"
 version = "0.1.0"
 dependencies = [
  "command",
+ "futures",
  "instant",
  "log",
+ "reqwest",
+ "rustls 0.23.39",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokio",
+ "websocket",
 ]
 
 [[package]]

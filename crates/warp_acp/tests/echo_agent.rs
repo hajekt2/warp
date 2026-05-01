@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use warp_acp::{
     AcpAgentCommand, AcpClient, AcpEnvironmentVariable, AgentMessage, AuthenticateRequest,
-    ContentBlock, NewSessionRequest,
+    ContentBlock, LoadSessionRequest, NewSessionRequest,
 };
 
 #[test]
@@ -81,6 +81,44 @@ fn echo_fixture_accepts_multiple_prompts_on_one_session() {
         .all(|update| update["sessionId"] == "echo-session"));
     assert_eq!(updates[0]["update"]["content"]["text"], "echo: first");
     assert_eq!(updates[1]["update"]["content"]["text"], "echo: second");
+}
+
+#[test]
+fn echo_fixture_loads_existing_session() {
+    let exe = env!("CARGO_BIN_EXE_echo_acp_agent");
+    let command = AcpAgentCommand::new(exe);
+    let client = AcpClient::spawn(&command).expect("spawn echo ACP fixture");
+
+    client.initialize("Warp test").expect("initialize");
+    client
+        .load_session(LoadSessionRequest::new(
+            "persisted-echo-session",
+            std::env::current_dir().unwrap(),
+        ))
+        .expect("load session");
+
+    let updates: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let updates_for_handler = Arc::clone(&updates);
+    client
+        .prompt_with_agent_message_handler(
+            warp_acp::SessionId::new("persisted-echo-session"),
+            vec![ContentBlock::text("after restart")],
+            move |message| {
+                if let AgentMessage::Notification { method, params } = message {
+                    if method == "session/update" {
+                        updates_for_handler.lock().unwrap().push(params.clone());
+                    }
+                }
+            },
+        )
+        .expect("prompt after load");
+
+    let updates = updates.lock().unwrap();
+    assert_eq!(updates[0]["sessionId"], "persisted-echo-session");
+    assert_eq!(
+        updates[0]["update"]["content"]["text"],
+        "echo: after restart"
+    );
 }
 
 #[test]

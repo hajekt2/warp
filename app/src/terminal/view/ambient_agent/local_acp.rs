@@ -5,11 +5,11 @@ use std::{
 
 use anyhow::{anyhow, Context as _};
 use warp_acp::{
-    AcpAgentCommand, AcpClient, AgentMessage, AuthenticateRequest, ClientCapabilities,
+    AcpAgentConnection, AcpClient, AgentMessage, AuthenticateRequest, ClientCapabilities,
     ClientRequestUi, ContentBlock, FileSystemCapabilities, Implementation, InitializeRequest,
-    LocalClientRequestError, LocalClientRequestHandler, LocalClientRequestPolicy, McpServer,
-    NewSessionRequest, RequestPermissionRequest, RequestPermissionResponse,
-    SessionId as AcpSessionId, WriteTextFileRequest,
+    LoadSessionRequest, LocalClientRequestError, LocalClientRequestHandler,
+    LocalClientRequestPolicy, McpServer, NewSessionRequest, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId as AcpSessionId, WriteTextFileRequest,
 };
 use warpui::{
     modals::{AlertDialogWithCallbacks, ModalButton},
@@ -21,6 +21,7 @@ use crate::ai::agent::AIAgentOutput;
 use crate::ai::agent_sdk::driver::{AcpStreamingOutputBuilder, AgentDriver};
 use crate::ai::blocklist::history_model::StreamingExchangeHandle;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::persistence::model::AcpSessionResumeMetadata;
 use crate::settings::ai::AcpAgentId;
 
 use super::model::AmbientAgentViewModel;
@@ -217,6 +218,15 @@ impl LocalAcpRuntimeSession {
             && &self.working_dir == working_dir
             && &self.request_policy == request_policy
     }
+
+    fn resume_metadata(&self) -> AcpSessionResumeMetadata {
+        AcpSessionResumeMetadata {
+            agent_id: self.agent_id.as_str().to_string(),
+            session_id: self.session_id.0.clone(),
+            command_argv: self.command_argv.clone(),
+            working_directory: Some(self.working_dir.display().to_string()),
+        }
+    }
 }
 
 pub(super) struct LocalAcpAgentModel {
@@ -283,7 +293,7 @@ impl LocalAcpAgentModel {
 
 pub(super) struct LocalAcpPromptRequest {
     pub(super) agent_id: AcpAgentId,
-    pub(super) command: AcpAgentCommand,
+    pub(super) connection: AcpAgentConnection,
     pub(super) command_argv: Vec<String>,
     pub(super) prompt: String,
     pub(super) working_dir: PathBuf,
@@ -292,6 +302,7 @@ pub(super) struct LocalAcpPromptRequest {
     pub(super) terminal_view_id: EntityId,
     pub(super) existing_conversation_id: Option<AIConversationId>,
     existing_session: Option<LocalAcpRuntimeSession>,
+    persisted_session: Option<AcpSessionResumeMetadata>,
     pub(super) foreground: ModelSpawner<AmbientAgentViewModel>,
     pub(super) client_request_ui: Arc<dyn ClientRequestUi>,
 }
@@ -300,7 +311,7 @@ impl LocalAcpPromptRequest {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         agent_id: AcpAgentId,
-        command: AcpAgentCommand,
+        connection: AcpAgentConnection,
         command_argv: Vec<String>,
         prompt: String,
         working_dir: PathBuf,
@@ -309,12 +320,13 @@ impl LocalAcpPromptRequest {
         terminal_view_id: EntityId,
         existing_conversation_id: Option<AIConversationId>,
         existing_session: Option<LocalAcpRuntimeSession>,
+        persisted_session: Option<AcpSessionResumeMetadata>,
         foreground: ModelSpawner<AmbientAgentViewModel>,
         client_request_ui: Arc<dyn ClientRequestUi>,
     ) -> Self {
         Self {
             agent_id,
-            command,
+            connection,
             command_argv,
             prompt,
             working_dir,
@@ -323,6 +335,7 @@ impl LocalAcpPromptRequest {
             terminal_view_id,
             existing_conversation_id,
             existing_session,
+            persisted_session,
             foreground,
             client_request_ui,
         }
@@ -347,24 +360,26 @@ impl LocalAcpPromptRequest {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
         let acp_run = tokio::task::spawn_blocking({
             let agent_id = self.agent_id.clone();
-            let command = self.command.clone();
+            let connection = self.connection.clone();
             let command_argv = self.command_argv.clone();
             let prompt = self.prompt.clone();
             let working_dir = self.working_dir.clone();
             let request_policy = self.request_policy.clone();
             let mcp_servers = self.mcp_servers.clone();
             let existing_session = self.existing_session.clone();
+            let persisted_session = self.persisted_session.clone();
             let client_request_ui = Arc::clone(&self.client_request_ui);
             move || {
                 run_prompt_blocking(
                     agent_id,
-                    command,
+                    connection,
                     command_argv,
                     prompt,
                     working_dir,
                     request_policy,
                     mcp_servers,
                     existing_session,
+                    persisted_session,
                     output_tx,
                     client_request_ui,
                 )
@@ -427,6 +442,8 @@ impl LocalAcpPromptRequest {
         let Some(runtime_session) = completed_acp_session else {
             return Err(anyhow!("Local ACP prompt failed"));
         };
+        self.persist_session_metadata(stream_handle.conversation_id, &runtime_session)
+            .await?;
         Ok(LocalAcpPromptResult {
             conversation_id: stream_handle.conversation_id,
             runtime_session,
@@ -508,6 +525,22 @@ impl LocalAcpPromptRequest {
             .await?
             .map_err(|error| anyhow!(error))
     }
+
+    async fn persist_session_metadata(
+        &self,
+        conversation_id: AIConversationId,
+        runtime_session: &LocalAcpRuntimeSession,
+    ) -> anyhow::Result<()> {
+        let metadata = runtime_session.resume_metadata();
+        self.foreground
+            .spawn(move |_, ctx| {
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                    history.set_acp_session_resume_metadata(conversation_id, metadata, ctx);
+                });
+            })
+            .await
+            .map_err(|error| anyhow!(error))
+    }
 }
 
 pub(super) struct LocalAcpPromptResult {
@@ -523,13 +556,14 @@ impl LocalAcpPromptResult {
 
 fn run_prompt_blocking(
     agent_id: AcpAgentId,
-    command: AcpAgentCommand,
+    connection: AcpAgentConnection,
     command_argv: Vec<String>,
     prompt: String,
     working_dir: PathBuf,
     request_policy: LocalClientRequestPolicy,
     mcp_servers: Vec<McpServer>,
     existing_session: Option<LocalAcpRuntimeSession>,
+    persisted_session: Option<AcpSessionResumeMetadata>,
     output_tx: tokio::sync::mpsc::UnboundedSender<AIAgentOutput>,
     client_request_ui: Arc<dyn ClientRequestUi>,
 ) -> anyhow::Result<(AIAgentOutput, LocalAcpRuntimeSession)> {
@@ -543,11 +577,12 @@ fn run_prompt_blocking(
     } else {
         create_runtime_session(
             agent_id,
-            command,
+            connection,
             command_argv,
             working_dir,
             request_policy,
             mcp_servers,
+            persisted_session,
         )?
     };
 
@@ -583,15 +618,19 @@ fn run_prompt_blocking(
 
 fn create_runtime_session(
     agent_id: AcpAgentId,
-    command: AcpAgentCommand,
+    connection: AcpAgentConnection,
     command_argv: Vec<String>,
     working_dir: PathBuf,
     request_policy: LocalClientRequestPolicy,
     mcp_servers: Vec<McpServer>,
+    persisted_session: Option<AcpSessionResumeMetadata>,
 ) -> anyhow::Result<LocalAcpRuntimeSession> {
-    log::info!("Local ACP spawning subprocess");
-    let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
-    log::info!("Local ACP subprocess spawned; initializing");
+    log::info!(
+        "Local ACP connecting transport: {:?}",
+        connection.display_target()
+    );
+    let client = AcpClient::connect(&connection).map_err(anyhow::Error::from)?;
+    log::info!("Local ACP transport connected; initializing");
     let fs_capabilities = match (
         request_policy.allow_read_text_file,
         request_policy.allow_write_text_file,
@@ -625,16 +664,42 @@ fn create_runtime_session(
         mcp_servers,
         &initialize_response.agent_capabilities,
     );
-    let session = client
-        .new_session(NewSessionRequest::new(working_dir.clone()).with_mcp_servers(mcp_servers))
-        .map_err(anyhow::Error::from)?;
-    log::info!("Local ACP session created: {:?}", session.session_id);
+    let session_id = if let Some(metadata) = persisted_session {
+        log::info!(
+            "Local ACP loading persisted session {} for agent '{}'",
+            metadata.session_id,
+            agent_id.as_str()
+        );
+        match client.load_session(
+            LoadSessionRequest::new(metadata.session_id.clone(), working_dir.clone())
+                .with_mcp_servers(mcp_servers.clone()),
+        ) {
+            Ok(_) => AcpSessionId::new(metadata.session_id),
+            Err(error) => {
+                log::warn!(
+                    "Local ACP failed to load persisted session; starting a new session instead: {error:#}"
+                );
+                client
+                    .new_session(
+                        NewSessionRequest::new(working_dir.clone()).with_mcp_servers(mcp_servers),
+                    )
+                    .map_err(anyhow::Error::from)?
+                    .session_id
+            }
+        }
+    } else {
+        client
+            .new_session(NewSessionRequest::new(working_dir.clone()).with_mcp_servers(mcp_servers))
+            .map_err(anyhow::Error::from)?
+            .session_id
+    };
+    log::info!("Local ACP session ready: {:?}", session_id);
     Ok(LocalAcpRuntimeSession {
         agent_id,
         command_argv,
         working_dir,
         request_policy,
         client: Arc::new(client),
-        session_id: session.session_id,
+        session_id,
     })
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::command::AcpAgentCommand;
+use crate::command::{AcpAgentCommand, AcpAgentConnection};
 use crate::schema::{
     conservative_initialize_request, AuthenticateRequest, AuthenticateResponse,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, InitializeRequest, InitializeResponse,
@@ -12,7 +12,10 @@ use crate::schema::{
     ResumeSessionResponse, SessionId, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
 };
-use crate::transport::{JsonRpcStdioTransport, JsonRpcTransportError};
+use crate::transport::{
+    JsonRpcHttpTransport, JsonRpcStdioTransport, JsonRpcTransport, JsonRpcTransportError,
+    JsonRpcTransportHandle, JsonRpcWebSocketTransport,
+};
 use crate::{AgentMessage, JsonRpcErrorObject};
 
 const INITIALIZE_METHOD: &str = "initialize";
@@ -43,20 +46,35 @@ pub enum AcpClientError {
 }
 
 pub struct AcpClient {
-    transport: JsonRpcStdioTransport,
+    transport: JsonRpcTransport,
     initialize_timeout: Duration,
     prompt_timeout: Duration,
 }
 
 impl AcpClient {
     pub fn spawn(config: &AcpAgentCommand) -> Result<Self, AcpClientError> {
-        Ok(Self::new(JsonRpcStdioTransport::spawn(config)?))
+        Self::connect(&AcpAgentConnection::stdio(config.clone()))
+    }
+
+    pub fn connect(config: &AcpAgentConnection) -> Result<Self, AcpClientError> {
+        let transport = match config {
+            AcpAgentConnection::Stdio { command } => {
+                JsonRpcTransport::Stdio(JsonRpcStdioTransport::spawn(command)?)
+            }
+            AcpAgentConnection::Http { endpoint } => {
+                JsonRpcTransport::Http(JsonRpcHttpTransport::connect(endpoint)?)
+            }
+            AcpAgentConnection::WebSocket { endpoint } => {
+                JsonRpcTransport::WebSocket(JsonRpcWebSocketTransport::connect(endpoint)?)
+            }
+        };
+        Ok(Self::new(transport))
     }
 
     #[must_use]
-    pub fn new(transport: JsonRpcStdioTransport) -> Self {
+    pub fn new(transport: impl Into<JsonRpcTransport>) -> Self {
         Self {
-            transport,
+            transport: transport.into(),
             initialize_timeout: DEFAULT_INITIALIZE_TIMEOUT,
             prompt_timeout: DEFAULT_PROMPT_TIMEOUT,
         }
@@ -209,7 +227,7 @@ impl AcpClient {
     ) -> Result<PromptResponse, AcpClientError>
     where
         F: FnMut(AgentMessage),
-        G: FnMut(AgentMessage, &JsonRpcStdioTransport) -> Result<(), JsonRpcTransportError>,
+        G: FnMut(AgentMessage, &dyn JsonRpcTransportHandle) -> Result<(), JsonRpcTransportError>,
     {
         Ok(self.transport.request_timeout_with_handler(
             SESSION_PROMPT_METHOD,
@@ -245,7 +263,7 @@ impl AcpClient {
         id: crate::JsonRpcId,
         result: Value,
     ) -> Result<(), AcpClientError> {
-        Ok(self.transport.respond_result(id, result)?)
+        Ok(self.transport.respond_result_value(id, result)?)
     }
 
     pub fn respond_error(
@@ -256,13 +274,13 @@ impl AcpClient {
     ) -> Result<(), AcpClientError> {
         Ok(self
             .transport
-            .respond_error(id, crate::JsonRpcErrorObject::new(code, message))?)
+            .respond_error_object(id, crate::JsonRpcErrorObject::new(code, message))?)
     }
 }
 
 fn deny_unsupported_agent_request(
     message: AgentMessage,
-    transport: &JsonRpcStdioTransport,
+    transport: &dyn JsonRpcTransportHandle,
 ) -> Result<(), JsonRpcTransportError> {
     let AgentMessage::Request { id, method, .. } = message else {
         return Ok(());
@@ -271,7 +289,7 @@ fn deny_unsupported_agent_request(
     match method.as_str() {
         // We have not surfaced Warp's permission UI yet. A cancellation-shaped
         // response is safer than implicitly granting or hanging the agent.
-        "session/request_permission" => transport.respond_result(
+        "session/request_permission" => transport.respond_result_value(
             id,
             serde_json::json!({
                 "outcome": {
@@ -287,14 +305,14 @@ fn deny_unsupported_agent_request(
         | "terminal/output"
         | "terminal/release"
         | "terminal/wait_for_exit"
-        | "terminal/kill" => transport.respond_error(
+        | "terminal/kill" => transport.respond_error_object(
             id,
             JsonRpcErrorObject::new(
                 -32001,
                 format!("ACP client method `{method}` is not enabled"),
             ),
         ),
-        _ => transport.respond_error(
+        _ => transport.respond_error_object(
             id,
             JsonRpcErrorObject::new(-32601, format!("Unknown ACP client method `{method}`")),
         ),

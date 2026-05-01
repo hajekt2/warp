@@ -790,6 +790,57 @@ pub struct AcpAgentEnvVar {
     pub value: AcpAgentEnvValue,
 }
 
+/// One HTTP header for a remote ACP transport.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "HTTP header configuration for a remote ACP agent transport.")]
+pub struct AcpAgentHttpHeader {
+    pub name: String,
+    pub value: AcpAgentEnvValue,
+}
+
+/// Transport used to reach an ACP agent. Local stdio remains the default for
+/// registry agents; HTTP/WebSocket allow BYOK agents hosted on another machine.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[schemars(rename_all = "snake_case")]
+pub enum AcpAgentTransportConfig {
+    Local,
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: Vec<AcpAgentHttpHeader>,
+    },
+    WebSocket {
+        url: String,
+        #[serde(default)]
+        headers: Vec<AcpAgentHttpHeader>,
+    },
+}
+
+impl Default for AcpAgentTransportConfig {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
 /// Per-device confirmation state for commands that can execute local code.
 ///
 /// ACP command settings are intentionally local-only for now. This state gives the runner/UI a
@@ -833,6 +884,8 @@ pub struct AcpAgentConfig {
     pub name: String,
     pub command: String,
     #[serde(default)]
+    pub transport: AcpAgentTransportConfig,
+    #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<AcpAgentEnvVar>,
@@ -848,6 +901,10 @@ pub struct AcpAgentConfig {
 }
 
 impl AcpAgentConfig {
+    pub fn is_local_transport(&self) -> bool {
+        matches!(self.transport, AcpAgentTransportConfig::Local)
+    }
+
     pub fn to_launch_command(&self) -> anyhow::Result<warp_acp::AcpAgentCommand> {
         let mut command =
             warp_acp::AcpAgentCommand::new(self.command.clone()).args(self.args.clone());
@@ -873,11 +930,32 @@ impl AcpAgentConfig {
         Ok(command)
     }
 
+    pub fn to_agent_connection(&self) -> anyhow::Result<warp_acp::AcpAgentConnection> {
+        match &self.transport {
+            AcpAgentTransportConfig::Local => Ok(warp_acp::AcpAgentConnection::stdio(
+                self.to_launch_command()?,
+            )),
+            AcpAgentTransportConfig::Http { url, headers } => {
+                Ok(warp_acp::AcpAgentConnection::http(
+                    warp_acp::AcpRemoteEndpoint::new(url.clone())
+                        .headers(materialize_acp_headers(headers, &self.name)?),
+                ))
+            }
+            AcpAgentTransportConfig::WebSocket { url, headers } => {
+                Ok(warp_acp::AcpAgentConnection::websocket(
+                    warp_acp::AcpRemoteEndpoint::new(url.clone())
+                        .headers(materialize_acp_headers(headers, &self.name)?),
+                ))
+            }
+        }
+    }
+
     pub fn from_registry_entry(entry: &AcpAgentRegistryEntry) -> Self {
         Self {
             id: AcpAgentId::new(entry.registry_key),
             name: entry.name.to_owned(),
             command: entry.command.command.to_owned(),
+            transport: AcpAgentTransportConfig::Local,
             args: entry
                 .command
                 .args
@@ -891,6 +969,30 @@ impl AcpAgentConfig {
             local_confirmation: AcpAgentLocalConfirmation::default(),
         }
     }
+}
+
+fn materialize_acp_headers(
+    headers: &[AcpAgentHttpHeader],
+    agent_name: &str,
+) -> anyhow::Result<Vec<warp_acp::AcpHttpHeader>> {
+    headers
+        .iter()
+        .map(|header| {
+            let value = match &header.value {
+                AcpAgentEnvValue::Literal { value } => value.clone(),
+                AcpAgentEnvValue::SecretRef { key } => {
+                    anyhow::bail!(
+                        "ACP agent '{agent_name}' references secret header '{}', but ACP secret materialization is not wired yet",
+                        key
+                    );
+                }
+            };
+            Ok(warp_acp::AcpHttpHeader {
+                name: header.name.clone(),
+                value,
+            })
+        })
+        .collect()
 }
 
 /// A command template in the curated ACP registry.
@@ -1781,12 +1883,31 @@ impl AISettings {
         args: Vec<String>,
         ctx: &mut ModelContext<Self>,
     ) {
+        self.add_custom_acp_agent_config_with_transport(
+            name,
+            command,
+            args,
+            AcpAgentTransportConfig::Local,
+            ctx,
+        );
+    }
+
+    pub fn add_custom_acp_agent_config_with_transport(
+        &mut self,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+        transport: AcpAgentTransportConfig,
+        ctx: &mut ModelContext<Self>,
+    ) {
         if !FeatureFlag::AcpClient.is_enabled() {
             return;
         }
         let name = name.trim();
         let command = command.trim();
-        if name.is_empty() || command.is_empty() {
+        if name.is_empty()
+            || (command.is_empty() && matches!(transport, AcpAgentTransportConfig::Local))
+        {
             return;
         }
 
@@ -1806,6 +1927,7 @@ impl AISettings {
             id: candidate,
             name: name.to_string(),
             command: command.to_string(),
+            transport,
             args,
             env: Vec::new(),
             mcp_allowlist: Vec::new(),
@@ -1831,7 +1953,7 @@ impl AISettings {
         config.command = config.command.trim().to_string();
         if config.id.as_str().trim().is_empty()
             || config.name.is_empty()
-            || config.command.is_empty()
+            || (config.command.is_empty() && config.is_local_transport())
         {
             return;
         }

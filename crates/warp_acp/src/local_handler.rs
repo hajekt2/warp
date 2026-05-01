@@ -16,7 +16,7 @@ use crate::schema::{
     TerminalExitStatus, TerminalOutputResponse, TerminalRefRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
-use crate::{AgentMessage, JsonRpcErrorObject, JsonRpcStdioTransport, JsonRpcTransportError};
+use crate::{AgentMessage, JsonRpcErrorObject, JsonRpcTransportError, JsonRpcTransportHandle};
 
 const ERROR_DISABLED: i64 = -32001;
 const ERROR_PERMISSION_DENIED: i64 = -32002;
@@ -168,7 +168,7 @@ impl LocalClientRequestHandler {
     pub fn handle(
         &mut self,
         message: AgentMessage,
-        transport: &JsonRpcStdioTransport,
+        transport: &dyn JsonRpcTransportHandle,
     ) -> Result<(), JsonRpcTransportError> {
         let AgentMessage::Request { id, method, params } = message else {
             return Ok(());
@@ -184,7 +184,7 @@ impl LocalClientRequestHandler {
             "terminal/kill" => self.kill_terminal(params).map(to_json_value),
             "terminal/release" => self.release_terminal(params).map(to_json_value),
             _ => {
-                return transport.respond_error(
+                return transport.respond_error_object(
                     id,
                     JsonRpcErrorObject::new(
                         -32601,
@@ -195,8 +195,8 @@ impl LocalClientRequestHandler {
         };
 
         match response {
-            Ok(value) => transport.respond_result(id, value),
-            Err(error) => transport.respond_error(
+            Ok(value) => transport.respond_result_value(id, value),
+            Err(error) => transport.respond_error_object(
                 id,
                 JsonRpcErrorObject::new(error.json_rpc_code(), error.to_string()),
             ),

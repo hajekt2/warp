@@ -53,7 +53,7 @@ use crate::{
         blocklist::BlocklistAIHistoryEvent,
     },
     persistence::{
-        model::{AgentConversationData, PersistedAutoexecuteMode},
+        model::{AcpSessionResumeMetadata, AgentConversationData, PersistedAutoexecuteMode},
         ModelEvent,
     },
     ui_components::icons::Icon,
@@ -230,6 +230,9 @@ pub struct AIConversation {
     /// event log. Used on restore to resume event delivery without
     /// re-delivering already-processed events.
     last_event_sequence: Option<i64>,
+
+    /// Local ACP session metadata used to reload an agent-side session after restart.
+    acp_session_resume: Option<AcpSessionResumeMetadata>,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -280,6 +283,7 @@ impl AIConversation {
             parent_conversation_id: None,
             is_remote_child: false,
             last_event_sequence: None,
+            acp_session_resume: None,
         }
     }
 
@@ -360,6 +364,7 @@ impl AIConversation {
             run_id,
             autoexecute_override,
             last_event_sequence,
+            acp_session_resume,
         ) = if let Some(data) = conversation_data {
             let server_conversation_token = data
                 .server_conversation_token
@@ -391,6 +396,7 @@ impl AIConversation {
                 AIConversationAutoexecuteMode::default()
             };
             let last_event_sequence = data.last_event_sequence;
+            let acp_session_resume = data.acp_session_resume;
 
             (
                 server_conversation_token,
@@ -404,6 +410,7 @@ impl AIConversation {
                 run_id,
                 autoexecute_override,
                 last_event_sequence,
+                acp_session_resume,
             )
         } else {
             (
@@ -417,6 +424,7 @@ impl AIConversation {
                 None,
                 None,
                 AIConversationAutoexecuteMode::default(),
+                None,
                 None,
             )
         };
@@ -461,6 +469,7 @@ impl AIConversation {
             parent_conversation_id,
             is_remote_child: false,
             last_event_sequence,
+            acp_session_resume,
         })
     }
 
@@ -704,6 +713,14 @@ impl AIConversation {
 
     pub fn server_conversation_token(&self) -> Option<&ServerConversationToken> {
         self.server_conversation_token.as_ref()
+    }
+
+    pub fn acp_session_resume(&self) -> Option<&AcpSessionResumeMetadata> {
+        self.acp_session_resume.as_ref()
+    }
+
+    pub(crate) fn set_acp_session_resume(&mut self, metadata: Option<AcpSessionResumeMetadata>) {
+        self.acp_session_resume = metadata;
     }
 
     /// Returns the server-assigned run identifier as a string.
@@ -3060,6 +3077,7 @@ impl AIConversation {
                 run_id: self.task_id.map(|id| id.to_string()),
                 autoexecute_override: Some(self.autoexecute_override.into()),
                 last_event_sequence: self.last_event_sequence,
+                acp_session_resume: self.acp_session_resume.clone(),
             },
         };
         ctx.spawn(

@@ -21,7 +21,9 @@ pub mod schema;
 mod transport;
 
 pub use client::{AcpClient, AcpClientError};
-pub use command::{AcpAgentCommand, AcpCommandError, AcpEnvironmentVariable};
+pub use command::{
+    AcpAgentCommand, AcpAgentConnection, AcpCommandError, AcpEnvironmentVariable, AcpRemoteEndpoint,
+};
 pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
 pub use local_handler::{
     AutoClientRequestUi, ClientRequestUi, LocalClientRequestError, LocalClientRequestHandler,
@@ -46,4 +48,7 @@ pub use schema::{
     TerminalRefRequest, TextContent, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
-pub use transport::{JsonRpcStdioTransport, JsonRpcTransportError};
+pub use transport::{
+    JsonRpcHttpTransport, JsonRpcStdioTransport, JsonRpcTransport, JsonRpcTransportError,
+    JsonRpcTransportHandle, JsonRpcWebSocketTransport,
+};

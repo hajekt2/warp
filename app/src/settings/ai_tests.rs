@@ -381,6 +381,7 @@ fn test_acp_agent_config_roundtrip() {
         id: AcpAgentId::new("opencode-local"),
         name: "OpenCode".to_string(),
         command: "opencode".to_string(),
+        transport: AcpAgentTransportConfig::Local,
         args: vec!["acp".to_string()],
         env: vec![AcpAgentEnvVar {
             name: "OPENCODE_CONFIG".to_string(),
@@ -530,6 +531,7 @@ fn test_upsert_acp_agent_config_replaces_existing_agent() {
                     id: AcpAgentId::new("local-agent"),
                     name: "Local Agent Updated".to_string(),
                     command: "new-acp".to_string(),
+                    transport: AcpAgentTransportConfig::Local,
                     args: vec!["--stdio".to_string()],
                     env: vec![AcpAgentEnvVar {
                         name: "TOKEN".to_string(),

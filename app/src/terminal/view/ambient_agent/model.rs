@@ -554,19 +554,23 @@ impl AmbientAgentViewModel {
             return;
         };
 
-        if let Err(error) = validate_cli_installed(&config.command, config.install_url.as_deref()) {
-            self.handle_spawn_error(error.to_string(), ctx);
-            return;
+        if config.is_local_transport() {
+            if let Err(error) =
+                validate_cli_installed(&config.command, config.install_url.as_deref())
+            {
+                self.handle_spawn_error(error.to_string(), ctx);
+                return;
+            }
         }
 
-        let command = match config.to_launch_command() {
+        let connection = match config.to_agent_connection() {
             Ok(command) => command,
             Err(error) => {
                 self.handle_spawn_error(error.to_string(), ctx);
                 return;
             }
         };
-        let command_argv = command.display_argv();
+        let command_argv = connection.display_target();
 
         let permissions = BlocklistAIPermissions::as_ref(ctx);
         let terminal_view_id = self.terminal_view_id;
@@ -597,6 +601,23 @@ impl AmbientAgentViewModel {
             &working_dir,
             &request_policy,
         );
+        let persisted_acp_session = existing_acp_session
+            .is_none()
+            .then(|| {
+                existing_conversation_id.and_then(|conversation_id| {
+                    let metadata = BlocklistAIHistoryModel::as_ref(ctx)
+                        .acp_session_resume_metadata(conversation_id)?;
+                    let working_dir_matches = metadata
+                        .working_directory
+                        .as_deref()
+                        .is_none_or(|dir| dir == working_dir.display().to_string());
+                    (metadata.agent_id == agent_id.as_str()
+                        && metadata.command_argv == command_argv
+                        && working_dir_matches)
+                        .then_some(metadata)
+                })
+            })
+            .flatten();
 
         self.local_acp_agent.mark_prompting();
         self.harness_command_started = true;
@@ -606,7 +627,7 @@ impl AmbientAgentViewModel {
 
         let request = LocalAcpPromptRequest::new(
             agent_id,
-            command,
+            connection,
             command_argv,
             prompt,
             working_dir,
@@ -615,6 +636,7 @@ impl AmbientAgentViewModel {
             terminal_view_id,
             existing_conversation_id,
             existing_acp_session,
+            persisted_acp_session,
             foreground,
             client_request_ui,
         );

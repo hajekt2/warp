@@ -31,7 +31,7 @@ use crate::ai::artifacts::Artifact;
 use crate::ai::document::ai_document_model::AIDocumentModel;
 use crate::ai::llms::LLMPreferences;
 use crate::input_suggestions::HistoryOrder;
-use crate::persistence::model::AgentConversationData;
+use crate::persistence::model::{AcpSessionResumeMetadata, AgentConversationData};
 use crate::persistence::ModelEvent;
 use crate::server::server_api::ServerApiProvider;
 use crate::terminal::model::block::BlockId;
@@ -476,6 +476,31 @@ impl BlocklistAIHistoryModel {
             return;
         };
         conversation.set_last_event_sequence(sequence);
+        conversation.write_updated_conversation_state(ctx);
+    }
+
+    /// Returns persisted ACP session metadata for a live conversation, if present.
+    pub fn acp_session_resume_metadata(
+        &self,
+        conversation_id: AIConversationId,
+    ) -> Option<AcpSessionResumeMetadata> {
+        self.conversations_by_id
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.acp_session_resume().cloned())
+    }
+
+    /// Updates the ACP session metadata stored alongside the conversation and
+    /// writes it through the normal conversation persistence path.
+    pub fn set_acp_session_resume_metadata(
+        &mut self,
+        conversation_id: AIConversationId,
+        metadata: AcpSessionResumeMetadata,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) else {
+            return;
+        };
+        conversation.set_acp_session_resume(Some(metadata));
         conversation.write_updated_conversation_state(ctx);
     }
 
@@ -1322,6 +1347,7 @@ impl BlocklistAIHistoryModel {
             // The event cursor belongs to the source conversation's run; the
             // forked conversation will establish its own cursor.
             last_event_sequence: None,
+            acp_session_resume: None,
         };
         let forked_conversation_id = AIConversationId::new();
         if let Err(e) = sqlite_sender.send(ModelEvent::UpdateMultiAgentConversation {
@@ -1477,6 +1503,7 @@ impl BlocklistAIHistoryModel {
             // The event cursor belongs to the source conversation's run; the
             // forked conversation will establish its own cursor.
             last_event_sequence: None,
+            acp_session_resume: None,
         };
 
         let forked_conversation_id = AIConversationId::new();
