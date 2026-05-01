@@ -14333,24 +14333,34 @@ impl Workspace {
 
         if let Some(terminal_handle) = pane_group_handle.as_ref(ctx).active_session_view(ctx) {
             #[cfg_attr(not(feature = "local_fs"), allow(unused_variables))]
-            let (session, path_if_local, is_local, is_wsl_session, session_id, pwd) =
-                terminal_handle.read(ctx, |terminal, ctx| {
-                    let active_session_id = terminal.active_block_session_id();
-                    let session = active_session_id
-                        .and_then(|id| terminal.sessions_model().as_ref(ctx).get(id));
-                    let path_if_local = terminal.active_session_path_if_local(ctx);
-                    let is_local = terminal.active_session_is_local(ctx);
-                    let is_wsl_session = session.as_ref().map(|s| s.is_wsl()).unwrap_or(false);
-                    let pwd = terminal.pwd();
-                    (
-                        session,
-                        path_if_local,
-                        is_local,
-                        is_wsl_session,
-                        active_session_id,
-                        pwd,
-                    )
-                });
+            let (
+                session,
+                path_if_local,
+                is_local,
+                is_pre_session_cloud_agent_composer,
+                is_wsl_session,
+                session_id,
+                pwd,
+            ) = terminal_handle.read(ctx, |terminal, ctx| {
+                let active_session_id = terminal.active_block_session_id();
+                let session =
+                    active_session_id.and_then(|id| terminal.sessions_model().as_ref(ctx).get(id));
+                let path_if_local = terminal.active_session_path_if_local(ctx);
+                let is_local = terminal.active_session_is_local(ctx);
+                let is_pre_session_cloud_agent_composer =
+                    terminal.is_pre_session_cloud_agent_composer();
+                let is_wsl_session = session.as_ref().map(|s| s.is_wsl()).unwrap_or(false);
+                let pwd = terminal.pwd();
+                (
+                    session,
+                    path_if_local,
+                    is_local,
+                    is_pre_session_cloud_agent_composer,
+                    is_wsl_session,
+                    active_session_id,
+                    pwd,
+                )
+            });
 
             let window_id = ctx.window_id();
             let working_directory_clone = path_if_local.clone();
@@ -14371,7 +14381,7 @@ impl Workspace {
                 }
             });
 
-            let is_remote = matches!(is_local, Some(false));
+            let is_remote = matches!(is_local, Some(false)) && !is_pre_session_cloud_agent_composer;
             let is_unsupported_session = is_wsl_session;
 
             // Check whether this remote session has an active remote server
