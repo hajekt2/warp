@@ -12,6 +12,7 @@ use warp::{
     cmd_or_ctrl_shift,
     features::FeatureFlag,
     integration_testing::{
+        agent_mode::{assert_latest_exchange_text_contains, insert_streaming_agent_exchange},
         clipboard::assert_clipboard_contains_string,
         step::new_step_with_default_assertions,
         terminal::{
@@ -221,6 +222,23 @@ pub fn test_restored_ai_block_renders_mermaid_and_local_images() -> Builder {
                         )
                     })
                 }),
+        )
+}
+
+pub fn test_acp_streaming_exchange_renders_in_agent_history() -> Builder {
+    new_builder()
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(clear_blocklist_to_remove_bootstrapped_blocks())
+        .with_step(insert_streaming_agent_exchange(
+            "Please echo through ACP",
+            "final ACP output rendered in Warp",
+        ))
+        .with_step(
+            new_step_with_default_assertions("Assert ACP streamed output rendered")
+                .add_named_assertion(
+                    "Latest ACP exchange contains final streamed output",
+                    assert_latest_exchange_text_contains("final ACP output rendered in Warp"),
+                ),
         )
 }
 

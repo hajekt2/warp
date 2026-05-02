@@ -208,6 +208,7 @@ unindent = "0.1.7"
 url = { workspace = true, features = ["serde"] }
 urlocator.workspace = true
 uuid.workspace = true
+warp_acp.workspace = true
 warp_cli.workspace = true
 validator = "0.19.0"
 variant_count = "1.1.0"
@@ -423,6 +424,7 @@ embed-resource = "3.0"
 # Note that we support channel-specific enables for these features
 [features]
 ai_resume_button = []
+acp_client = []
 autoupdate = []
 figma_detection = []
 bundled_skills = []
@@ -577,6 +579,7 @@ default = [
     "sync_ambient_plans",
     "conversation_artifacts",
     "agent_view",
+    "acp_client",
     "agent_view_block_context",
     "agent_view_conversation_list_view",
     "inline_slash_commands",

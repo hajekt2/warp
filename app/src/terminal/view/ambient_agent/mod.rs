@@ -4,6 +4,7 @@ mod footer;
 mod harness_selector;
 mod host_selector;
 mod loading_screen;
+mod local_acp;
 mod model;
 mod model_selector;
 mod progress;
@@ -19,7 +20,9 @@ pub use host_selector::{
     Host, HostSelector, HostSelectorAction, HostSelectorEvent, NakedHeaderButtonTheme,
 };
 pub use loading_screen::{render_cloud_mode_error_screen, render_cloud_mode_loading_screen};
-pub use model::{AgentProgress, AmbientAgentViewModel, AmbientAgentViewModelEvent, Status};
+pub use model::{
+    AgentHarnessSelection, AgentProgress, AmbientAgentViewModel, AmbientAgentViewModelEvent, Status,
+};
 pub use model_selector::{ModelSelector, ModelSelectorAction, ModelSelectorEvent};
 pub use progress::{render_progress, ProgressProps, ProgressStep, ProgressStepState};
 pub use progress_ui_state::AmbientAgentProgressUIState;
@@ -101,6 +104,7 @@ pub fn create_cloud_mode_view(
                 | AmbientAgentViewModelEvent::HarnessSelected
                 | AmbientAgentViewModelEvent::HostSelected
                 | AmbientAgentViewModelEvent::HarnessCommandStarted
+                | AmbientAgentViewModelEvent::LocalAcpConversationReady { .. }
                 | AmbientAgentViewModelEvent::UpdatedSetupCommandVisibility => {}
             }
         });

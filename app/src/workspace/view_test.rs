@@ -2136,6 +2136,87 @@ fn find_non_following_tab_index(workspace: &Workspace, ctx: &AppContext) -> usiz
         .expect("Expected a non-following tab")
 }
 
+#[cfg(feature = "local_fs")]
+#[test]
+fn pre_session_cloud_agent_tab_uses_local_project_explorer_roots_without_becoming_local() {
+    let _agent_view_guard = FeatureFlag::AgentView.override_enabled(true);
+    let _cloud_mode_guard = FeatureFlag::CloudMode.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let temp_root = TempDir::new().expect("temp root");
+        let canonical_root = dunce::canonicalize(temp_root.path()).expect("canonical root");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let terminal_pane_group = workspace.active_tab_pane_group().clone();
+            let terminal_pane_group_id = terminal_pane_group.id();
+            let terminal_id = terminal_pane_group
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .expect("terminal tab has an active terminal")
+                .id();
+
+            workspace
+                .working_directories_model
+                .update(ctx, |model, ctx| {
+                    model.refresh_working_directories_for_pane_group(
+                        terminal_pane_group_id,
+                        vec![(terminal_id, canonical_root.display().to_string())],
+                        vec![],
+                        Some(terminal_id),
+                        ctx,
+                    );
+                });
+
+            workspace.add_tab_with_pane_layout(
+                PanesLayout::AmbientAgent,
+                Arc::new(HashMap::new()),
+                None,
+                ctx,
+            );
+            workspace.open_left_panel(ctx);
+            workspace.left_panel_view.update(ctx, |left_panel, ctx| {
+                left_panel.restore_active_view_from_snapshot(ToolPanelView::ProjectExplorer, ctx);
+            });
+
+            let cloud_pane_group = workspace.active_tab_pane_group().clone();
+            let cloud_terminal = cloud_pane_group
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .expect("cloud agent tab has an active terminal view");
+            cloud_terminal.read(ctx, |terminal, ctx| {
+                assert!(
+                    terminal.is_pre_session_cloud_agent_composer(),
+                    "test must exercise the new cloud-agent composer before a cloud session exists"
+                );
+                assert_eq!(
+                    terminal.active_session_is_local(ctx),
+                    Some(false),
+                    "the composer must remain remote-classified so cloud input routing still works"
+                );
+            });
+
+            workspace.update_active_session(ctx);
+
+            let file_tree_view = workspace
+                .working_directories_model
+                .as_ref(ctx)
+                .get_file_tree_view(cloud_pane_group.id())
+                .expect("active cloud tab should have a file tree view");
+            let displayed_roots =
+                file_tree_view.read(ctx, |view, _| view.displayed_root_paths_for_test());
+
+            assert_eq!(
+                displayed_roots,
+                vec![canonical_root],
+                "pre-session cloud composer should keep showing local project roots"
+            );
+        });
+    });
+}
+
 #[test]
 fn test_left_panel_window_scoped_reconciles_between_terminal_tabs_when_enabled() {
     let _conversation_list_guard =
@@ -2692,6 +2773,85 @@ fn test_unified_new_session_menu_uses_new_worktree_config_label_and_order() {
                 labels.get(separator_index + 2),
                 Some(&"New tab config".to_string())
             );
+        });
+    });
+}
+
+#[test]
+fn test_left_panel_conversation_list_available_for_local_acp_only() {
+    let _conversation_list = FeatureFlag::AgentViewConversationListView.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_conversation_history_entrypoint_enabled(ctx));
+        });
+
+        app.update(|ctx| {
+            let views = Workspace::compute_left_panel_views(ctx);
+            assert!(
+                views.contains(&ToolPanelView::ConversationListView),
+                "local ACP-only setups should expose the Agent conversations left-panel view"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_left_panel_conversation_list_unavailable_without_hosted_ai_or_local_acp() {
+    let _conversation_list = FeatureFlag::AgentViewConversationListView.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            assert!(!settings.is_conversation_history_entrypoint_enabled(ctx));
+        });
+
+        app.update(|ctx| {
+            let views = Workspace::compute_left_panel_views(ctx);
+            assert!(
+                !views.contains(&ToolPanelView::ConversationListView),
+                "conversation history should stay hidden when neither hosted AI nor local ACP is available"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_unified_new_session_menu_shows_agent_items_for_local_acp_only() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_local_agent_entrypoint_enabled(ctx));
+        });
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let labels = workspace
+                .unified_new_session_menu_items(ctx)
+                .iter()
+                .map(new_session_menu_label)
+                .collect::<Vec<_>>();
+
+            assert!(labels.iter().any(|label| label == "Agent"));
+            assert!(labels.iter().any(|label| label == "Cloud Oz"));
         });
     });
 }

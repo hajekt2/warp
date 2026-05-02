@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use instant::Instant;
 use session_sharing_protocol::common::SessionId;
+use warp_acp::LocalClientRequestPolicy;
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
@@ -10,6 +11,8 @@ use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 use crate::ai::agent::{conversation::AIConversationId, extract_user_query_mode};
+use crate::ai::agent_sdk::driver::AgentDriver;
+use crate::ai::agent_sdk::validate_cli_installed;
 use crate::ai::ambient_agents::spawn::{spawn_task, submit_run_followup, AmbientAgentEvent};
 use crate::ai::ambient_agents::task::HarnessConfig;
 use crate::ai::ambient_agents::telemetry::CloudAgentTelemetryEvent;
@@ -17,9 +20,11 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::{
     OUT_OF_CREDITS_TASK_FAILURE_MESSAGE, SERVER_OVERLOADED_TASK_FAILURE_MESSAGE,
 };
-use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
-use crate::ai::execution_profiles::{CloudAgentComputerUseState, ComputerUsePermission};
+use crate::ai::execution_profiles::{
+    ActionPermission, CloudAgentComputerUseState, ComputerUsePermission,
+};
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
 use crate::server::cloud_objects::update_manager::UpdateManager;
@@ -28,9 +33,11 @@ use crate::server::server_api::ai::{
     AgentConfigSnapshot, AmbientAgentTaskState, AttachmentInput, SpawnAgentRequest,
 };
 use crate::server::server_api::{AIApiError, CloudAgentCapacityError, ServerApiProvider};
+use crate::settings::ai::{AISettings, AcpAgentId};
 use crate::terminal::view::ambient_agent::SetupCommandState;
 use crate::terminal::CLIAgent;
 
+use super::local_acp::{LocalAcpAgentModel, LocalAcpClientRequestUi, LocalAcpPromptRequest};
 use super::AmbientAgentProgressUIState;
 
 /// Tracks progress timestamps for each step during ambient agent spawning.
@@ -93,6 +100,38 @@ pub enum Status {
     Cancelled { progress: AgentProgress },
 }
 
+/// Local UI/runtime identity for the selected agent backend.
+///
+/// Built-in harnesses remain represented by [`Harness`]. Dynamic ACP agents carry a stable
+/// settings ID instead of being encoded into a field-bearing harness enum variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHarnessSelection {
+    Builtin(Harness),
+    Acp(AcpAgentId),
+}
+
+impl Default for AgentHarnessSelection {
+    fn default() -> Self {
+        Self::Builtin(Harness::default())
+    }
+}
+
+impl AgentHarnessSelection {
+    pub fn builtin_harness(&self) -> Option<Harness> {
+        match self {
+            Self::Builtin(harness) => Some(*harness),
+            Self::Acp(_) => None,
+        }
+    }
+
+    pub fn acp_agent_id(&self) -> Option<&AcpAgentId> {
+        match self {
+            Self::Builtin(_) => None,
+            Self::Acp(id) => Some(id),
+        }
+    }
+}
+
 /// Model to track the state of an ambient agent run.
 pub struct AmbientAgentViewModel {
     status: Status,
@@ -122,9 +161,11 @@ pub struct AmbientAgentViewModel {
     /// from the server response can be wired back to the conversation.
     conversation_id: Option<AIConversationId>,
 
-    /// Selected execution harness for the cloud agent run.
-    /// Defaults to `Harness::Oz`. Used to populate `AgentConfigSnapshot.harness` on spawn.
-    harness: Harness,
+    /// Selected execution backend for the cloud agent run.
+    /// Defaults to built-in `Harness::Oz`. Built-in selections populate
+    /// `AgentConfigSnapshot.harness` on spawn; ACP selections are kept local until the ACP runner
+    /// path is implemented.
+    harness_selection: AgentHarnessSelection,
     /// Selected worker host for the cloud agent run. Populated from the HostSelector
     /// (which resolves env var > workspace setting) and read by `spawn_agent`.
     worker_host: Option<String>,
@@ -135,6 +176,8 @@ pub struct AmbientAgentViewModel {
     /// there is no oz `AppendedExchange` to key off of.
     harness_command_started: bool,
 
+    /// Local ACP runtime state, independent from cloud/Oz task metadata.
+    local_acp_agent: LocalAcpAgentModel,
     active_execution_session_id: Option<SessionId>,
     last_ended_execution_session_id: Option<SessionId>,
 }
@@ -165,10 +208,11 @@ impl AmbientAgentViewModel {
             setup_commands_state: Default::default(),
             task_id: None,
             conversation_id: None,
-            harness: Harness::default(),
+            harness_selection: AgentHarnessSelection::default(),
             worker_host: None,
             has_inserted_cloud_mode_user_query_block: false,
             harness_command_started: false,
+            local_acp_agent: LocalAcpAgentModel::new(),
             active_execution_session_id: None,
             last_ended_execution_session_id: None,
         }
@@ -260,14 +304,28 @@ impl AmbientAgentViewModel {
     }
 
     pub fn selected_harness(&self) -> Harness {
-        self.harness
+        self.harness_selection
+            .builtin_harness()
+            .unwrap_or(Harness::Oz)
+    }
+
+    pub fn selected_harness_selection(&self) -> &AgentHarnessSelection {
+        &self.harness_selection
     }
 
     pub fn set_harness(&mut self, harness: Harness, ctx: &mut ModelContext<Self>) {
-        if self.harness == harness {
+        self.set_harness_selection(AgentHarnessSelection::Builtin(harness), ctx);
+    }
+
+    pub fn set_harness_selection(
+        &mut self,
+        selection: AgentHarnessSelection,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.harness_selection == selection {
             return;
         }
-        self.harness = harness;
+        self.harness_selection = selection;
         ctx.emit(AmbientAgentViewModelEvent::HarnessSelected);
     }
 
@@ -278,7 +336,13 @@ impl AmbientAgentViewModel {
     /// True when the run is configured to use a non-Oz execution harness and the
     /// required feature flags are enabled.
     pub(super) fn is_third_party_harness(&self) -> bool {
-        FeatureFlag::AgentHarness.is_enabled() && self.harness != Harness::Oz
+        FeatureFlag::AgentHarness.is_enabled()
+            && matches!(
+                self.harness_selection,
+                AgentHarnessSelection::Builtin(harness) if harness != Harness::Oz
+            )
+            || (FeatureFlag::AcpClient.is_enabled()
+                && matches!(self.harness_selection, AgentHarnessSelection::Acp(_)))
     }
 
     /// Returns the [`CLIAgent`] corresponding to the currently selected harness when it is a
@@ -286,11 +350,11 @@ impl AmbientAgentViewModel {
     /// Used to drive the correct tab icon for a cloud run as soon as a non-oz harness is
     /// selected, even before the CLI session is registered with [`CLIAgentSessionsModel`].
     pub fn selected_third_party_cli_agent(&self) -> Option<CLIAgent> {
-        CLIAgent::from_harness(self.harness)
+        CLIAgent::from_harness(self.selected_harness())
     }
 
     /// Whether the harness CLI has started running. Only meaningful for non-oz runs.
-    pub(super) fn harness_command_started(&self) -> bool {
+    pub(crate) fn harness_command_started(&self) -> bool {
         self.harness_command_started
     }
 
@@ -298,7 +362,7 @@ impl AmbientAgentViewModel {
     /// Idempotent: subsequent calls after the first are no-ops and do not re-emit.
     pub(super) fn mark_harness_command_started(&mut self, ctx: &mut ModelContext<Self>) {
         debug_assert!(
-            self.harness != Harness::Oz,
+            self.selected_harness() != Harness::Oz,
             "harness_command_started is only meaningful for non-oz runs"
         );
         if self.harness_command_started {
@@ -527,6 +591,7 @@ impl AmbientAgentViewModel {
         self.environment_id = None;
         self.task_id = None;
         self.conversation_id = None;
+        self.local_acp_agent.reset();
         self.has_inserted_cloud_mode_user_query_block = false;
         self.harness_command_started = false;
         self.active_execution_session_id = None;
@@ -538,6 +603,146 @@ impl AmbientAgentViewModel {
     /// Sets the local conversation ID associated with this cloud agent run.
     pub fn set_conversation_id(&mut self, id: Option<AIConversationId>) {
         self.conversation_id = id;
+        self.local_acp_agent.set_conversation_id(id);
+    }
+
+    /// Spawn a configured local ACP agent directly in this terminal's agent history.
+    ///
+    /// ACP agents are local stdio subprocesses, not cloud environments. They must not route
+    /// through `spawn_task` because that requires Warp-hosted AI auth and a server task.
+    pub fn spawn_local_acp_agent(
+        &mut self,
+        prompt: String,
+        attachments: Vec<AttachmentInput>,
+        working_dir: PathBuf,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let AgentHarnessSelection::Acp(agent_id) = self.harness_selection.clone() else {
+            self.spawn_agent(prompt, attachments, ctx);
+            return;
+        };
+
+        if !attachments.is_empty() {
+            log::warn!(
+                "Ignoring {} attachment(s) for local ACP prompt",
+                attachments.len()
+            );
+        }
+
+        let Some(config) = AISettings::as_ref(ctx).acp_agent_config(&agent_id).cloned() else {
+            self.handle_spawn_error(
+                format!("Configured ACP agent '{agent_id}' was not found."),
+                ctx,
+            );
+            return;
+        };
+
+        if config.is_local_transport() {
+            if let Err(error) =
+                validate_cli_installed(&config.command, config.install_url.as_deref())
+            {
+                self.handle_spawn_error(error.to_string(), ctx);
+                return;
+            }
+        }
+
+        let connection = match config.to_agent_connection(ctx) {
+            Ok(command) => command,
+            Err(error) => {
+                self.handle_spawn_error(error.to_string(), ctx);
+                return;
+            }
+        };
+        let command_argv = connection.display_target();
+
+        let permissions = BlocklistAIPermissions::as_ref(ctx);
+        let terminal_view_id = self.terminal_view_id;
+        let read_files_setting = permissions.get_read_files_setting(ctx, Some(terminal_view_id));
+        let apply_diffs_setting =
+            permissions.get_apply_code_diffs_setting(ctx, Some(terminal_view_id));
+        let execute_commands_setting =
+            permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
+        let request_policy = LocalClientRequestPolicy {
+            workspace_root: working_dir.clone(),
+            allow_read_text_file: !matches!(read_files_setting, ActionPermission::Unknown),
+            allow_write_text_file: !matches!(apply_diffs_setting, ActionPermission::Unknown),
+            allow_terminal: !matches!(execute_commands_setting, ActionPermission::Unknown),
+            allow_permission_selection: true,
+        };
+        let mcp_servers = AgentDriver::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
+        let foreground = ctx.spawner();
+        let client_request_ui = Arc::new(LocalAcpClientRequestUi::new(
+            foreground.clone(),
+            read_files_setting.is_always_ask(),
+            !apply_diffs_setting.is_always_allow(),
+            !execute_commands_setting.is_always_allow(),
+        ));
+        let existing_conversation_id = self.local_acp_agent.conversation_id();
+        let existing_acp_session = self.local_acp_agent.matching_session(
+            &agent_id,
+            &command_argv,
+            &working_dir,
+            &request_policy,
+        );
+        if existing_acp_session.is_none() {
+            self.local_acp_agent.clear_runtime_session();
+        }
+        let persisted_acp_session = existing_acp_session
+            .is_none()
+            .then(|| {
+                existing_conversation_id.and_then(|conversation_id| {
+                    let metadata = BlocklistAIHistoryModel::as_ref(ctx)
+                        .acp_session_resume_metadata(conversation_id)?;
+                    let working_dir_matches = metadata
+                        .working_directory
+                        .as_deref()
+                        .is_none_or(|dir| dir == working_dir.display().to_string());
+                    (metadata.agent_id == agent_id.as_str()
+                        && metadata.command_argv == command_argv
+                        && working_dir_matches)
+                        .then_some(metadata)
+                })
+            })
+            .flatten();
+
+        self.local_acp_agent.mark_prompting();
+        self.harness_command_started = true;
+        self.status = Status::AgentRunning;
+        ctx.emit(AmbientAgentViewModelEvent::DispatchedAgent);
+        ctx.emit(AmbientAgentViewModelEvent::HarnessCommandStarted);
+
+        let request = LocalAcpPromptRequest::new(
+            agent_id,
+            connection,
+            command_argv,
+            prompt,
+            working_dir,
+            request_policy,
+            mcp_servers,
+            terminal_view_id,
+            existing_conversation_id,
+            existing_acp_session,
+            persisted_acp_session,
+            foreground,
+            client_request_ui,
+        );
+
+        ctx.spawn(request.run(), |me, result, ctx| match result {
+            Ok(prompt_result) => {
+                me.conversation_id = Some(prompt_result.conversation_id);
+                me.local_acp_agent.mark_finished(
+                    prompt_result.conversation_id,
+                    prompt_result.into_runtime_session(),
+                );
+                me.status = Status::Composing;
+                ctx.emit(AmbientAgentViewModelEvent::EnteredComposingState);
+            }
+            Err(error) => {
+                let error_message = format!("ACP agent failed: {error:#}");
+                me.local_acp_agent.mark_failed(error_message.clone());
+                me.handle_spawn_error(error_message, ctx);
+            }
+        });
     }
 
     /// Spawn an ambient agent with the given prompt and current session configuration.
@@ -557,14 +762,23 @@ impl AmbientAgentViewModel {
             ComputerUsePermission::resolve_cloud_agent_state(ctx);
         let computer_use_enabled = Some(enabled);
 
-        let harness_override =
-            (self.harness != Harness::Oz).then(|| HarnessConfig::from_harness_type(self.harness));
+        let default_host = std::env::var("WARP_CLOUD_MODE_DEFAULT_HOST")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let harness_override = match &self.harness_selection {
+            AgentHarnessSelection::Builtin(Harness::Oz) => None,
+            AgentHarnessSelection::Builtin(harness) => {
+                Some(HarnessConfig::from_harness_type(*harness))
+            }
+            AgentHarnessSelection::Acp(id) => Some(HarnessConfig::from_acp_agent_id(id.clone())),
+        };
 
         let config = Some(AgentConfigSnapshot {
             environment_id: self.environment_id.as_ref().map(|id| id.to_string()),
             model_id: Some(model_id),
             computer_use_enabled,
-            worker_host: self.worker_host.clone(),
+            worker_host: self.worker_host.clone().or(default_host),
             harness: harness_override,
             ..Default::default()
         });
@@ -1044,10 +1258,36 @@ pub enum AmbientAgentViewModelEvent {
     /// Fires once per run and signals the transition out of the pre-first-exchange phase
     /// for claude / gemini / other third-party harnesses.
     HarnessCommandStarted,
+    /// A local ACP run completed in the local agent history and should be shown in agent view.
+    LocalAcpConversationReady {
+        conversation_id: AIConversationId,
+    },
 
     UpdatedSetupCommandVisibility,
 }
 
 impl Entity for AmbientAgentViewModel {
     type Event = AmbientAgentViewModelEvent;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_harness_selection_preserves_static_harness_identity() {
+        let selection = AgentHarnessSelection::Builtin(Harness::Claude);
+
+        assert_eq!(selection.builtin_harness(), Some(Harness::Claude));
+        assert_eq!(selection.acp_agent_id(), None);
+    }
+
+    #[test]
+    fn acp_harness_selection_uses_dynamic_settings_identity() {
+        let id = AcpAgentId::new("opencode");
+        let selection = AgentHarnessSelection::Acp(id.clone());
+
+        assert_eq!(selection.builtin_harness(), None);
+        assert_eq!(selection.acp_agent_id(), Some(&id));
+    }
 }

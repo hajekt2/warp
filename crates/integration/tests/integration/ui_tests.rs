@@ -298,6 +298,7 @@ integration_tests! {
     #[ignore = "Affected by agent_view feature flag UI changes"]
     test_selection_last_to_ai_lines,
     test_restored_ai_block_renders_mermaid_and_local_images,
+    test_acp_streaming_exchange_renders_in_agent_history,
 
     // Middle-click-paste is only implemented for Linux right now.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

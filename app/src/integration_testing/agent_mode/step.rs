@@ -3,6 +3,7 @@ use std::{fs::read, io::Cursor, path::Path, time::Duration};
 use prost::Message;
 use warpui::{async_assert, integration::TestStep, SingletonEntity};
 
+use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::execution_profiles::ActionPermission;
 use crate::ai::llms::{LLMId, LLMPreferences};
@@ -85,6 +86,35 @@ pub fn hydrate_ai_conversation(file_name: &str) -> TestStep {
     new_step_with_default_assertions("Hydrate AI conversation").add_named_assertion(
         "Assert that conversation was hydrated successfully",
         hydrate_ai_conversation_assertion(tasks),
+    )
+}
+
+/// Inserts an ACP-style streaming exchange through the same history model path used by the
+/// JSON-RPC ACP harness, then finishes it. This keeps integration coverage focused on the
+/// native Warp conversation/rendering bridge without depending on external ACP binaries.
+pub fn insert_streaming_agent_exchange(prompt: &'static str, output: &'static str) -> TestStep {
+    new_step_with_default_assertions("Insert ACP streaming exchange").add_named_assertion(
+        "Stream and finish ACP exchange",
+        move |app, window_id| {
+            let terminal_view = terminal_view(app, window_id, 0, 0);
+            BlocklistAIHistoryModel::handle(app).update(app, |history, ctx| {
+                let handle = history
+                    .start_streaming_exchange(terminal_view.id(), prompt.to_string(), None, ctx)
+                    .expect("ACP streaming exchange should start");
+                history
+                    .update_streaming_exchange(
+                        terminal_view.id(),
+                        &handle,
+                        "partial ACP output".to_string(),
+                        ctx,
+                    )
+                    .expect("ACP streaming exchange should update");
+                history
+                    .finish_streaming_exchange(terminal_view.id(), &handle, output.to_string(), ctx)
+                    .expect("ACP streaming exchange should finish");
+            });
+            async_assert!(true, "Inserted ACP streaming exchange")
+        },
     )
 }
 

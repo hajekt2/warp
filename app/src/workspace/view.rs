@@ -247,6 +247,8 @@ use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::network::{NetworkStatus, NetworkStatusEvent};
 use crate::notebooks::manager::{NotebookManager, NotebookSource};
 #[cfg(feature = "local_fs")]
+use crate::pane_group::working_directories::WorkingDirectory;
+#[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
 use crate::pane_group::{
     self, AnyPaneContent, CodeDiffPane, CodePane, Direction, NewTerminalOptions, PanesLayout,
@@ -3003,7 +3005,8 @@ impl Workspace {
 
         ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| match event {
             AISettingsChangedEvent::IsAnyAIEnabled { .. }
-            | AISettingsChangedEvent::ShowConversationHistory { .. } => {
+            | AISettingsChangedEvent::ShowConversationHistory { .. }
+            | AISettingsChangedEvent::AcpAgentConfigs { .. } => {
                 me.update_left_panel_available_views(ctx);
                 ctx.notify();
             }
@@ -6037,16 +6040,16 @@ impl Workspace {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
 
-        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let ai_settings = AISettings::as_ref(ctx);
+        let is_local_agent_entrypoint_enabled = ai_settings.is_local_agent_entrypoint_enabled(ctx);
         let effective_default = ai_settings.default_session_mode(ctx);
         let default_tab_config_path = ai_settings.default_tab_config_path().to_string();
         let shortcut_label = keybinding_name_to_display_string(NEW_TAB_BINDING_NAME, ctx);
         let reopen_closed_session_shortcut_label =
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
 
-        // 1. Agent (if AI enabled)
-        if is_any_ai_enabled {
+        // 1. Agent (if hosted AI or a local ACP agent is available)
+        if is_local_agent_entrypoint_enabled {
             let mut agent_item = MenuItemFields::new("Agent")
                 .with_on_select_action(WorkspaceAction::AddAgentTab)
                 .with_icon(icons::Icon::LayoutAlt01);
@@ -6113,7 +6116,7 @@ impl Workspace {
         }
 
         // 3. Cloud Oz (if flags enabled)
-        if is_any_ai_enabled
+        if is_local_agent_entrypoint_enabled
             && FeatureFlag::AgentView.is_enabled()
             && FeatureFlag::CloudMode.is_enabled()
         {
@@ -7826,7 +7829,7 @@ impl Workspace {
     /// will respect the user's visibility preference (restored from workspace state).
     fn maybe_auto_open_conversation_list(&mut self, ctx: &mut ViewContext<Self>) {
         if !FeatureFlag::AgentViewConversationListView.is_enabled()
-            || !AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+            || !AISettings::as_ref(ctx).is_conversation_history_entrypoint_enabled(ctx)
         {
             return;
         }
@@ -12812,6 +12815,49 @@ impl Workspace {
         });
     }
 
+    #[cfg(feature = "local_fs")]
+    fn local_project_explorer_fallback_directories_for_pane_group(
+        &mut self,
+        active_pane_group_id: warpui::EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<WorkingDirectory> {
+        let pane_groups: Vec<_> = self.tabs.iter().map(|tab| tab.pane_group.clone()).collect();
+
+        for pane_group in pane_groups {
+            if pane_group.id() == active_pane_group_id {
+                continue;
+            }
+
+            let directories: Vec<WorkingDirectory> =
+                self.working_directories_model.read(ctx, |model, _| {
+                    model
+                        .most_recent_directories_for_pane_group(pane_group.id())
+                        .map(|dirs| dirs.collect())
+                        .unwrap_or_default()
+                });
+
+            if !directories.is_empty() {
+                return directories;
+            }
+
+            self.refresh_working_directories_for_pane_group(&pane_group, ctx);
+
+            let directories: Vec<WorkingDirectory> =
+                self.working_directories_model.read(ctx, |model, _| {
+                    model
+                        .most_recent_directories_for_pane_group(pane_group.id())
+                        .map(|dirs| dirs.collect())
+                        .unwrap_or_default()
+                });
+
+            if !directories.is_empty() {
+                return directories;
+            }
+        }
+
+        Vec::new()
+    }
+
     /// Opens the in-app network log pane as a right-split of the active pane
     /// group. If a pane already exists for the current window, refreshes its
     /// snapshot from the in-memory model and focuses it instead of opening
@@ -14249,6 +14295,7 @@ impl Workspace {
                 session,
                 path_if_local,
                 is_local,
+                is_pre_session_cloud_agent_composer,
                 is_wsl_session,
                 session_id,
                 pwd,
@@ -14259,6 +14306,8 @@ impl Workspace {
                     active_session_id.and_then(|id| terminal.sessions_model().as_ref(ctx).get(id));
                 let path_if_local = terminal.active_session_path_if_local(ctx);
                 let is_local = terminal.active_session_is_local(ctx);
+                let is_pre_session_cloud_agent_composer =
+                    terminal.is_pre_session_cloud_agent_composer();
                 let is_wsl_session = session.as_ref().map(|s| s.is_wsl()).unwrap_or(false);
                 let pwd = terminal.pwd();
                 let has_pending_ssh = terminal.has_pending_ssh_command();
@@ -14266,6 +14315,7 @@ impl Workspace {
                     session,
                     path_if_local,
                     is_local,
+                    is_pre_session_cloud_agent_composer,
                     is_wsl_session,
                     active_session_id,
                     pwd,
@@ -14292,7 +14342,7 @@ impl Workspace {
                 }
             });
 
-            let is_remote = matches!(is_local, Some(false));
+            let is_remote = matches!(is_local, Some(false)) && !is_pre_session_cloud_agent_composer;
             let is_unsupported_session = is_wsl_session;
 
             // Check whether this remote session has an active remote server
@@ -14322,6 +14372,15 @@ impl Workspace {
                 is_unsupported_session,
                 has_remote_server,
             );
+            #[cfg(feature = "local_fs")]
+            let project_explorer_fallback_directories = if is_pre_session_cloud_agent_composer {
+                self.local_project_explorer_fallback_directories_for_pane_group(
+                    pane_group_handle.id(),
+                    ctx,
+                )
+            } else {
+                Vec::new()
+            };
 
             // When an SSH command is running (pending host set + block
             // still long-running), the old local session is still active
@@ -14337,6 +14396,12 @@ impl Workspace {
 
             self.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.update_coding_panel_enablement(enablement, ctx);
+                #[cfg(feature = "local_fs")]
+                left_panel.set_project_explorer_directory_fallback(
+                    is_pre_session_cloud_agent_composer,
+                    project_explorer_fallback_directories,
+                    ctx,
+                );
             });
 
             #[cfg(feature = "local_fs")]
@@ -14359,6 +14424,8 @@ impl Workspace {
 
             self.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.update_coding_panel_enablement(enablement, ctx);
+                #[cfg(feature = "local_fs")]
+                left_panel.set_project_explorer_directory_fallback(false, Vec::new(), ctx);
             });
 
             #[cfg(feature = "local_fs")]
@@ -19638,8 +19705,7 @@ impl Workspace {
     fn compute_left_panel_views(ctx: &AppContext) -> Vec<ToolPanelView> {
         let mut views = vec![];
         if FeatureFlag::AgentViewConversationListView.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
-            && *AISettings::as_ref(ctx).show_conversation_history
+            && AISettings::as_ref(ctx).is_conversation_history_entrypoint_enabled(ctx)
         {
             views.push(ToolPanelView::ConversationListView);
         }
@@ -21770,7 +21836,7 @@ impl View for Workspace {
             context.set.insert("IsOnline");
         }
 
-        if AISettings::as_ref(app).is_any_ai_enabled(app) {
+        if AISettings::as_ref(app).is_local_agent_entrypoint_enabled(app) {
             context.set.insert(flags::IS_ANY_AI_ENABLED);
         }
 
@@ -21841,9 +21907,7 @@ impl View for Workspace {
             context.set.insert(flags::ENABLE_WARP_DRIVE);
         }
 
-        if AISettings::as_ref(app).is_any_ai_enabled(app)
-            && *AISettings::as_ref(app).show_conversation_history
-        {
+        if AISettings::as_ref(app).is_conversation_history_entrypoint_enabled(app) {
             context.set.insert(flags::SHOW_CONVERSATION_HISTORY);
         }
 

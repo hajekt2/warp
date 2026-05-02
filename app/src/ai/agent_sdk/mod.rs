@@ -68,7 +68,7 @@ use crate::ai::skills::{
 };
 
 pub(crate) use driver::harness::{
-    task_env_vars, validate_cli_installed, ClaudeHarness, ThirdPartyHarness,
+    task_env_vars, validate_cli_installed, AcpHarness, ClaudeHarness, ThirdPartyHarness,
 };
 pub use driver::AgentDriver;
 use telemetry::CliTelemetryEvent;
@@ -253,10 +253,13 @@ fn run_agent(
             if args.skill.is_some() && !FeatureFlag::OzPlatformSkills.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--skill' found"));
             }
+            if args.harness == Harness::Acp && !FeatureFlag::AcpClient.is_enabled() {
+                return Err(anyhow::anyhow!("unexpected argument '--harness acp' found"));
+            }
             if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
             }
-            if args.harness == Harness::OpenCode {
+            if args.harness == Harness::OpenCode && !FeatureFlag::AcpClient.is_enabled() {
                 return Err(anyhow::anyhow!(
                     "The opencode harness is only supported for local child agent launches."
                 ));
@@ -296,6 +299,9 @@ fn run_agent(
                 return Err(anyhow::anyhow!(
                     "unexpected argument '--conversation' found"
                 ));
+            }
+            if args.harness == Harness::Acp && !FeatureFlag::AcpClient.is_enabled() {
+                return Err(anyhow::anyhow!("unexpected argument '--harness acp' found"));
             }
             if args.harness != Harness::Oz && !FeatureFlag::AgentHarness.is_enabled() {
                 return Err(anyhow::anyhow!("unexpected argument '--harness' found"));
@@ -343,9 +349,8 @@ fn build_merged_config_and_task(
         None => (None, None),
     };
 
-    let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
-        harness_type: args.harness,
-    });
+    let harness_override =
+        (args.harness != Harness::Oz).then_some(HarnessConfig::from_harness_type(args.harness));
 
     let mut merged_config = AgentConfigSnapshot {
         // CLI name > skill name > file name
@@ -427,9 +432,8 @@ fn build_server_side_task(
         .map(|model_id| common::validate_agent_mode_base_model_id(model_id, ctx))
         .transpose()?;
 
-    let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
-        harness_type: args.harness,
-    });
+    let harness_override =
+        (args.harness != Harness::Oz).then_some(HarnessConfig::from_harness_type(args.harness));
 
     let skill_name = resolved_skill.as_ref().map(|s| s.name.clone());
     let model_id_string = model_override.as_ref().map(|id| id.to_string());
@@ -562,19 +566,23 @@ impl AgentDriverRunner {
         server_api: Arc<dyn AIClient>,
         output_format: OutputFormat,
     ) -> Result<(), AgentDriverError> {
-        // Ensure we've synced team state before starting the driver.
-        Self::refresh_team_metadata(&foreground).await?;
+        let is_login_optional_local_acp_run = is_login_optional_local_acp_run(&args);
 
-        // Wait for Warp Drive to sync before building the task config, since
-        // prompt resolution (SavedPrompt -> workflow lookup) and environment
-        // resolution (CloudAmbientAgentEnvironment lookup) depend on it.
-        if foreground
-            .spawn(|_, ctx| common::refresh_warp_drive(ctx))
-            .await?
-            .await
-            .is_err()
-        {
-            return Err(AgentDriverError::WarpDriveSyncFailed);
+        if !is_login_optional_local_acp_run {
+            // Ensure we've synced team state before starting the driver.
+            Self::refresh_team_metadata(&foreground).await?;
+
+            // Wait for Warp Drive to sync before building the task config, since
+            // prompt resolution (SavedPrompt -> workflow lookup) and environment
+            // resolution (CloudAmbientAgentEnvironment lookup) depend on it.
+            if foreground
+                .spawn(|_, ctx| common::refresh_warp_drive(ctx))
+                .await?
+                .await
+                .is_err()
+            {
+                return Err(AgentDriverError::WarpDriveSyncFailed);
+            }
         }
 
         // Extract the task ID if available, so that if there are setup errors and we have
@@ -652,6 +660,7 @@ impl AgentDriverRunner {
             }
 
             match &task.harness {
+                HarnessKind::Acp(_) => {}
                 HarnessKind::Unsupported(harness) => {
                     return Err(AgentDriverError::HarnessSetupFailed {
                         harness: harness.to_string(),
@@ -777,6 +786,8 @@ impl AgentDriverRunner {
         args: RunAgentArgs,
         server_api: &Arc<dyn AIClient>,
     ) -> Result<(AgentDriverOptions, Task, Option<String>), AgentDriverError> {
+        let is_login_optional_local_acp_run = is_login_optional_local_acp_run(&args);
+
         // Get the working directory
         let working_dir = match args.cwd.as_ref() {
             Some(dir) => dunce::canonicalize(dir)
@@ -845,26 +856,28 @@ impl AgentDriverRunner {
             )
             .await?
         } else {
-            // Extract the prompt text that we'll pass up to the server when we create the task.
-            let prompt_for_task_creation = match &prompt {
-                Some(Prompt::PlainText(text)) => text.clone(),
-                Some(Prompt::SavedPrompt(id)) => format!("Saved prompt ({id})"),
-                None => skill
-                    .as_ref()
-                    .map(|s| format!("/{}", s.skill_identifier))
-                    // If we get to this point and we don't have a prompt, saved prompt, or skill,
-                    // error. `clap` should have handled this when parsing args already.
-                    .ok_or(AgentDriverError::InvalidRuntimeState)?,
-            };
+            if !is_login_optional_local_acp_run {
+                // Extract the prompt text that we'll pass up to the server when we create the task.
+                let prompt_for_task_creation = match &prompt {
+                    Some(Prompt::PlainText(text)) => text.clone(),
+                    Some(Prompt::SavedPrompt(id)) => format!("Saved prompt ({id})"),
+                    None => skill
+                        .as_ref()
+                        .map(|s| format!("/{}", s.skill_identifier))
+                        // If we get to this point and we don't have a prompt, saved prompt, or skill,
+                        // error. `clap` should have handled this when parsing args already.
+                        .ok_or(AgentDriverError::InvalidRuntimeState)?,
+                };
 
-            Self::initialize_new_task(
-                foreground,
-                server_api,
-                prompt_for_task_creation,
-                merged_config,
-                &mut driver_options,
-            )
-            .await?;
+                Self::initialize_new_task(
+                    foreground,
+                    server_api,
+                    prompt_for_task_creation,
+                    merged_config,
+                    &mut driver_options,
+                )
+                .await?;
+            }
             None
         };
         // Resolve environment and cloud providers.
@@ -1047,27 +1060,30 @@ impl AgentDriverRunner {
                 }
             }
         };
-        let (parent_run_id, task_conversation_id, task_harness) = match task_metadata_result {
-            Ok(Some(task_metadata)) => {
-                // The task's harness is stored on the snapshot; if absent, it's the default Oz.
-                let task_harness = task_metadata
-                    .agent_config_snapshot
-                    .as_ref()
-                    .and_then(|c| c.harness.as_ref())
-                    .map(|h| h.harness_type)
-                    .unwrap_or(Harness::Oz);
-                (
-                    task_metadata.parent_run_id,
-                    task_metadata.conversation_id,
-                    Some(task_harness),
-                )
-            }
-            Ok(None) => (None, None, None),
-            Err(err) => {
-                log::warn!("Failed to fetch task metadata: {err:#}");
-                (None, None, None)
-            }
-        };
+        let (parent_run_id, task_conversation_id, task_harness, task_acp_agent_id) =
+            match task_metadata_result {
+                Ok(Some(task_metadata)) => {
+                    // The task's harness is stored on the snapshot; if absent, it's the default Oz.
+                    let harness_config = task_metadata
+                        .agent_config_snapshot
+                        .as_ref()
+                        .and_then(|c| c.harness.as_ref());
+                    let task_harness = harness_config
+                        .map(|h| h.harness_type)
+                        .unwrap_or(Harness::Oz);
+                    (
+                        task_metadata.parent_run_id,
+                        task_metadata.conversation_id,
+                        Some(task_harness),
+                        harness_config.and_then(|h| h.acp_agent_id.clone()),
+                    )
+                }
+                Ok(None) => (None, None, None, None),
+                Err(err) => {
+                    log::warn!("Failed to fetch task metadata: {err:#}");
+                    (None, None, None, None)
+                }
+            };
 
         // Validate the requested `--harness` against the task's harness setting. This avoids the
         // extra conversation-metadata roundtrip that would otherwise be needed downstream when the
@@ -1079,6 +1095,11 @@ impl AgentDriverRunner {
                 &mut driver_options.selected_harness,
                 task_harness,
             )?;
+        }
+        if let Some(agent_id) = task_acp_agent_id {
+            if matches!(task.harness, HarnessKind::Acp(_)) {
+                task.harness = HarnessKind::Acp(AcpHarness::with_agent_id(agent_id));
+            }
         }
 
         // Set the task ID on the ServerApi so it's sent with all subsequent requests.
@@ -1170,6 +1191,7 @@ impl AgentDriverRunner {
                         .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))),
                 )
             }
+            HarnessKind::Acp(harness) => Err(harness.setup_error()),
             HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
                 harness: harness.to_string(),
                 reason: format!(
@@ -1257,11 +1279,25 @@ impl AgentDriverRunner {
     }
 }
 
+/// Returns `true` when an ACP run is fully local and can use a user-configured
+/// ACP agent without a Warp account. Server-backed affordances (saved prompts,
+/// cloud conversations/tasks, environments, sharing, and managed cloud
+/// credentials) still require Warp auth because they need Warp APIs.
+fn is_login_optional_local_acp_run(args: &RunAgentArgs) -> bool {
+    matches!(args.harness, Harness::Acp | Harness::OpenCode)
+        && args.prompt_arg.saved_prompt.is_none()
+        && args.task_id.is_none()
+        && args.conversation.is_none()
+        && args.environment.is_none()
+        && !args.share.is_shared()
+        && args.bedrock_inference_role.is_none()
+}
+
 /// Returns `true` if the given CLI command requires authentication.
 fn command_requires_auth(command: &CliCommand) -> bool {
     match command {
         CliCommand::Agent(agent_cmd) => match agent_cmd {
-            AgentCommand::Run { .. } => true,
+            AgentCommand::Run(args) => !is_login_optional_local_acp_run(args),
             AgentCommand::RunCloud { .. } => true,
             AgentCommand::Profile(sub) => match sub {
                 AgentProfileCommand::List => true,
@@ -1405,6 +1441,7 @@ fn resolve_orchestration_harness_label() -> &'static str {
         Some(Harness::Claude) => "claude",
         Some(Harness::OpenCode) => "opencode",
         Some(Harness::Gemini) => "gemini",
+        Some(Harness::Acp) => "acp",
         Some(Harness::Codex) => "codex",
         Some(Harness::Unknown) | None => "unknown",
     }

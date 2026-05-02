@@ -1,8 +1,10 @@
 use std::any::Any;
 use std::cell::RefCell;
+use std::fs;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai::agent::conversation::ConversationStatus;
 use parking_lot::FairMutex;
@@ -27,7 +29,7 @@ use crate::{
 use crate::context_chips::prompt::Prompt;
 use crate::editor::{AutosuggestionLocation, AutosuggestionType};
 
-use crate::settings::{AISettings, AppEditorSettings, WarpPromptSeparator};
+use crate::settings::{AISettings, AcpAgentId, AppEditorSettings, WarpPromptSeparator};
 
 use crate::ai::blocklist::agent_view::toolbar_item::AgentToolbarItemKind;
 use crate::ai::blocklist::{
@@ -515,6 +517,740 @@ fn root_cloud_mode_pane_sets_root_cloud_mode_context_key() {
                 .set
                 .contains(init::ROOT_CLOUD_MODE_PANE_KEY));
         });
+    });
+}
+
+#[test]
+fn set_input_mode_agent_enters_cloud_composer_when_only_local_acp_is_configured() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _cloud_mode_from_local = FeatureFlag::CloudModeFromLocalSession.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let root_view = terminal.clone();
+        let terminal_for_stack = terminal.clone();
+        let root_model = terminal.read(&app, |view, _| view.model.clone());
+        let pane_stack = app.update(move |ctx| {
+            let root_manager = ctx.add_model(|_| {
+                let manager: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: root_model,
+                    view: root_view.clone(),
+                });
+                manager
+            });
+            let pane_stack = ctx.add_model(|ctx| PaneStack::new(root_manager, root_view, ctx));
+            terminal_for_stack.update(ctx, |view, ctx| {
+                view.set_pane_stack(pane_stack.downgrade(), ctx);
+            });
+            pane_stack
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(!view.agent_view_controller().as_ref(ctx).is_active());
+            view.handle_action(&TerminalAction::SetInputModeAgent, ctx);
+        });
+
+        let active_view = app.read_model(&pane_stack, |stack, _| stack.active_view().clone());
+        assert_ne!(active_view.id(), terminal.id());
+        active_view.read(&app, |view, ctx| {
+            let ambient_model = view
+                .ambient_agent_view_model()
+                .expect("Ctrl+I should open cloud composer for local ACP-only setup");
+            assert!(ambient_model.as_ref(ctx).is_configuring_ambient_agent());
+            assert!(view.agent_view_controller().as_ref(ctx).is_active());
+        });
+    });
+}
+
+#[test]
+fn enter_submits_configured_acp_agent_prompt_when_warp_ai_disabled() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config("Test ACP", "true", vec![], ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_local_agent_entrypoint_enabled(ctx));
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("test-acp")),
+                        ctx,
+                    );
+                    assert!(model.is_configuring_ambient_agent());
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.buffer_text(ctx).is_empty(),
+                "submitted ACP prompt should clear the input buffer"
+            );
+        });
+        terminal.read(&app, |view, ctx| {
+            let ambient_agent_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model");
+            assert!(
+                ambient_agent_model.as_ref(ctx).is_agent_running(),
+                "Enter should dispatch the configured ACP agent locally instead of starting a cloud environment"
+            );
+            assert!(
+                ambient_agent_model.as_ref(ctx).harness_command_started(),
+                "local ACP should be treated as a started local harness immediately"
+            );
+            assert!(
+                !ambient_agent::is_cloud_agent_pre_first_exchange(
+                    view.ambient_agent_view_model(),
+                    view.agent_view_controller(),
+                    ctx,
+                ),
+                "local ACP should not show the Oz/cloud startup placeholder while waiting for a shared session"
+            );
+        });
+    });
+}
+
+#[test]
+fn enter_runs_configured_acp_agent_without_calling_interactive_auth() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-login-agent-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-login-agent-{}-{fixture_nonce}.log",
+            std::process::id(),
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "initialize pid=$$" >> "$log_path"
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"login-fixture","version":"test"}},"authMethods":[{{"id":"opencode-login","name":"Login with opencode","description":"Run `opencode auth login` in the terminal"}}]}}}}'
+IFS= read -r line || exit 1
+case "$line" in
+  *'"method":"authenticate"'*)
+    printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32603,"message":"authenticate should not be called for interactive login methods"}}}}'
+    exit 0
+    ;;
+esac
+printf '%s\n' "new_session pid=$$" >> "$log_path"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"login-fixture-session"}}}}'
+prompt_id=3
+prompt_count=0
+while IFS= read -r line; do
+  prompt_count=$((prompt_count + 1))
+  printf '%s\n' "prompt $prompt_count pid=$$" >> "$log_path"
+  case "$line" in
+    *again*) output="echo: again after $prompt_count prompts" ;;
+    *) output="echo: test after $prompt_count prompts" ;;
+  esac
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"login-fixture-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+done
+"#,
+                log_path = log_path.display(),
+            ),
+        )
+        .expect("write ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Login ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("login-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && view.agent_view_controller().as_ref(ctx).is_active()
+            }),
+            "configured ACP login fixture should open the local agent conversation immediately while the prompt is still running"
+        );
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                let has_visible_agent_view_ai_block =
+                    view.rich_content_views.iter().any(|rich_content| {
+                        rich_content.agent_view_conversation_id() == Some(conversation.id())
+                            && rich_content.ai_block_metadata().is_some_and(|metadata| {
+                                metadata.conversation_id == conversation.id()
+                                    && metadata.exchange_id == exchange.id
+                            })
+                    });
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && view.agent_view_controller().as_ref(ctx).is_active()
+                    && has_visible_agent_view_ai_block
+                    && exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("echo: test after 1 prompts")
+            }),
+            "configured ACP login fixture should finish the submit loop, keep the AI block visible in agent view, and stream output instead of calling authenticate"
+        );
+
+        let first_conversation_id = terminal.read(&app, |view, ctx| {
+            BlocklistAIHistoryModel::as_ref(ctx)
+                .active_conversation(view.view_id)
+                .expect("first ACP prompt should leave an active conversation")
+                .id()
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("again", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                conversation.id() == first_conversation_id
+                    && conversation.exchange_count() == 2
+                    && view.active_conversation_id(ctx) == Some(first_conversation_id)
+                    && view.agent_view_controller().as_ref(ctx).is_active()
+                    && exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("echo: again after 2 prompts")
+            }),
+            "configured ACP follow-up should append to the existing local ACP conversation instead of replacing history"
+        );
+
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("initialize").count(),
+            1,
+            "ACP follow-up should reuse the initialized subprocess; log:\n{fixture_log}"
+        );
+        assert_eq!(
+            fixture_log.matches("new_session").count(),
+            1,
+            "ACP follow-up should reuse the initialized session; log:\n{fixture_log}"
+        );
+        assert_eq!(
+            fixture_log.matches("prompt ").count(),
+            2,
+            "fixture should receive both prompts on one session; log:\n{fixture_log}"
+        );
+
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
+    });
+}
+
+#[test]
+fn configured_acp_agent_reuses_session_across_two_prompts() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-stateful-agent-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-stateful-agent-{}-{fixture_nonce}.log",
+            std::process::id(),
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "start pid=$$" >> "$log_path"
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"stateful-fixture","version":"test"}},"authMethods":[]}}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stateful-fixture-session"}}}}'
+prompt_id=3
+last_prompt=''
+while IFS= read -r line; do
+  case "$line" in
+    *first*) current='first' ;;
+    *second*) current='second' ;;
+    *) current='unknown' ;;
+  esac
+  if [ -n "$last_prompt" ]; then
+    output="prior:$last_prompt;current:$current"
+  else
+    output="current:$current"
+  fi
+  printf '%s\n' "prompt:$current pid=$$" >> "$log_path"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"stateful-fixture-session\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+  last_prompt="$current"
+done
+"#,
+                log_path = log_path.display(),
+            ),
+        )
+        .expect("write ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Stateful ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("stateful-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("first", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("current:first")
+            }),
+            "first ACP prompt should complete"
+        );
+
+        let first_conversation_id = terminal.read(&app, |view, ctx| {
+            BlocklistAIHistoryModel::as_ref(ctx)
+                .active_conversation(view.view_id)
+                .expect("first prompt should create a conversation")
+                .id()
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("second", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                conversation.id() == first_conversation_id
+                    && conversation.exchange_count() == 2
+                    && exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("prior:first;current:second")
+            }),
+            "second ACP prompt should reuse the same process/session and see turn-one context"
+        );
+
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("start pid=").count(),
+            1,
+            "two prompts should use one ACP subprocess; log:\n{fixture_log}"
+        );
+
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_file(log_path);
+    });
+}
+
+#[test]
+fn configured_acp_agent_reset_on_command_change() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let fixture_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let log_path = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-{}-{fixture_nonce}.log",
+            std::process::id(),
+        ));
+        let script_a = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-a-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+        let script_b = std::env::temp_dir().join(format!(
+            "warp-acp-command-change-b-{}-{fixture_nonce}.sh",
+            std::process::id(),
+        ));
+
+        for (script_path, label) in [(&script_a, "a"), (&script_b, "b")] {
+            fs::write(
+                script_path,
+                format!(
+                    r#"#!/bin/sh
+log_path='{log_path}'
+printf '%s\n' "start:{label} pid=$$" >> "$log_path"
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"command-change-fixture","version":"{label}"}},"authMethods":[]}}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"command-change-{label}"}}}}'
+prompt_id=3
+last_prompt=''
+while IFS= read -r line; do
+  case "$line" in
+    *first*) current='first' ;;
+    *second*) current='second' ;;
+    *) current='unknown' ;;
+  esac
+  if [ -n "$last_prompt" ]; then
+    output="prior:$last_prompt;current:$current;agent:{label}"
+  else
+    output="current:$current;agent:{label}"
+  fi
+  printf '%s\n' "prompt:$current:{label} pid=$$" >> "$log_path"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"command-change-{label}\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"$output\"}}}}}}}}"
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  prompt_id=$((prompt_id + 1))
+  last_prompt="$current"
+done
+"#,
+                    log_path = log_path.display(),
+                ),
+            )
+            .expect("write ACP fixture");
+        }
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Command Change ACP",
+                "sh",
+                vec![script_a.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new(
+                            "command-change-acp",
+                        )),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("first", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                exchange.output_status.is_finished_and_successful()
+                    && exchange
+                        .format_output_for_copy(None)
+                        .contains("current:first;agent:a")
+            }),
+            "first ACP prompt should complete on command A"
+        );
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.upsert_acp_agent_config(
+                crate::settings::AcpAgentConfig {
+                    id: AcpAgentId::new("command-change-acp"),
+                    name: "Command Change ACP".to_string(),
+                    command: "sh".to_string(),
+                    transport: crate::settings::AcpAgentTransportConfig::Local,
+                    args: vec![script_b.display().to_string()],
+                    env: Vec::new(),
+                    mcp_allowlist: Vec::new(),
+                    install_url: None,
+                    registry_key: None,
+                    local_confirmation: crate::settings::AcpAgentLocalConfirmation {
+                        confirmed_on_this_device: true,
+                        confirmed_at: None,
+                    },
+                },
+                ctx,
+            );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("second", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                let output = exchange.format_output_for_copy(None);
+                conversation.exchange_count() == 2
+                    && exchange.output_status.is_finished_and_successful()
+                    && output.contains("current:second;agent:b")
+                    && !output.contains("prior:first")
+            }),
+            "changing the ACP command should clear the old runtime session and start a fresh process"
+        );
+
+        let fixture_log = fs::read_to_string(&log_path).expect("fixture log should exist");
+        assert_eq!(
+            fixture_log.matches("start:").count(),
+            2,
+            "command change should spawn a new ACP subprocess; log:\n{fixture_log}"
+        );
+        assert!(fixture_log.contains("start:a"));
+        assert!(fixture_log.contains("start:b"));
+
+        let _ = fs::remove_file(script_a);
+        let _ = fs::remove_file(script_b);
+        let _ = fs::remove_file(log_path);
+    });
+}
+
+#[test]
+fn enter_surfaces_configured_acp_agent_failure_in_agent_history() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let global_resource_handles = crate::GlobalResourceHandles::mock(&mut app);
+        app.add_singleton_model(|_| {
+            crate::GlobalResourceHandlesProvider::new(global_resource_handles)
+        });
+        let _agent_mode = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
+        let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+        let script_path = std::env::temp_dir().join(format!(
+            "warp-acp-failing-agent-{}-{}.sh",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"failing-fixture","version":"test"},"authMethods":[]}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom from failing ACP fixture"}}'
+"#,
+        )
+        .expect("write failing ACP fixture");
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_custom_acp_agent_config(
+                "Fail ACP",
+                "sh",
+                vec![script_path.display().to_string()],
+                ctx,
+            );
+        });
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_ambient_agent_setup(None, ctx);
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .update(ctx, |model, ctx| {
+                    model.set_harness_selection(
+                        ambient_agent::AgentHarnessSelection::Acp(AcpAgentId::new("fail-acp")),
+                        ctx,
+                    );
+                });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.replace_buffer_content("test", ctx);
+            input.input_enter(ctx);
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                let Some(conversation) =
+                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation(view.view_id)
+                else {
+                    return false;
+                };
+                let Some(exchange) = conversation.latest_exchange() else {
+                    return false;
+                };
+                let output = exchange.format_output_for_copy(None);
+                view.active_conversation_id(ctx) == Some(conversation.id())
+                    && exchange.output_status.is_finished_and_successful()
+                    && output.contains("ACP agent failed")
+                    && output.contains("boom from failing ACP fixture")
+            }),
+            "configured ACP failures should open the local agent conversation and render the error instead of returning to an empty composer"
+        );
+
+        let _ = fs::remove_file(script_path);
     });
 }
 
@@ -1795,6 +2531,41 @@ fn test_alt_scroll_sequences() {
                     .filter(|b| *b == escape_sequences::EscCodes::ARROW_UP)
                     .count(),
                 5
+            );
+        });
+    })
+}
+
+#[test]
+fn new_cloud_agent_composer_does_not_remote_gate_project_explorer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_is_dummy_cloud_mode_session_for_test(true);
+            view.model.lock().set_shared_session_status(
+                crate::terminal::shared_session::SharedSessionStatus::ViewPending,
+            );
+
+            let is_local = view.active_session_is_local(ctx);
+            assert_eq!(is_local, Some(false));
+            assert!(view.is_pre_session_cloud_agent_composer());
+
+            let is_remote_for_project_explorer =
+                matches!(is_local, Some(false)) && !view.is_pre_session_cloud_agent_composer();
+            let enablement =
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::from_session_env(
+                    true,
+                    is_remote_for_project_explorer,
+                    false,
+                    false,
+                );
+            assert_eq!(
+                enablement,
+                crate::coding_panel_enablement_state::CodingPanelEnablementState::Enabled
             );
         });
     })
