@@ -9,17 +9,18 @@ use warp_cli::agent::Harness;
 
 use crate::ai::agent::conversation::AIAgentHarness;
 use crate::ai::blocklist::CLAUDE_ORANGE;
-use crate::terminal::cli_agent::GEMINI_BLUE;
+use crate::terminal::cli_agent::{GEMINI_BLUE, OPENAI_COLOR};
 use crate::ui_components::icons::Icon;
 
 /// User-visible display name for a [`Harness`].
 pub fn display_name(harness: Harness) -> &'static str {
     match harness {
-        Harness::Oz => "Warp Agent",
+        Harness::Oz => "Warp",
         Harness::Claude => "Claude Code",
         Harness::OpenCode => "OpenCode",
         Harness::Gemini => "Gemini CLI",
         Harness::Acp => "ACP",
+        Harness::Codex => "Codex",
         Harness::Unknown => "Unknown",
     }
 }
@@ -32,6 +33,7 @@ pub fn icon_for(harness: Harness) -> Icon {
         Harness::OpenCode => Icon::OpenCodeLogo,
         Harness::Gemini => Icon::GeminiLogo,
         Harness::Acp => Icon::Link,
+        Harness::Codex => Icon::OpenAILogo,
         Harness::Unknown => Icon::HelpCircle,
     }
 }
@@ -45,6 +47,7 @@ pub fn brand_color(harness: Harness) -> Option<ColorU> {
         Harness::OpenCode => None,
         Harness::Gemini => Some(GEMINI_BLUE),
         Harness::Acp => None,
+        Harness::Codex => Some(OPENAI_COLOR),
         Harness::Unknown => None,
     }
 }
@@ -57,6 +60,7 @@ impl From<AIAgentHarness> for Harness {
             AIAgentHarness::Oz => Harness::Oz,
             AIAgentHarness::ClaudeCode => Harness::Claude,
             AIAgentHarness::Gemini => Harness::Gemini,
+            AIAgentHarness::Codex => Harness::Codex,
             AIAgentHarness::Unknown => Harness::Unknown,
         }
     }
