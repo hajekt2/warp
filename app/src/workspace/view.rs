@@ -244,6 +244,8 @@ use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::network::{NetworkStatus, NetworkStatusEvent};
 use crate::notebooks::manager::{NotebookManager, NotebookSource};
 #[cfg(feature = "local_fs")]
+use crate::pane_group::working_directories::WorkingDirectory;
+#[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
 use crate::pane_group::{
     self, AnyPaneContent, CodeDiffPane, CodePane, Direction, NewTerminalOptions, PanesLayout,
@@ -12903,6 +12905,49 @@ impl Workspace {
         });
     }
 
+    #[cfg(feature = "local_fs")]
+    fn local_project_explorer_fallback_directories_for_pane_group(
+        &mut self,
+        active_pane_group_id: warpui::EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<WorkingDirectory> {
+        let pane_groups: Vec<_> = self.tabs.iter().map(|tab| tab.pane_group.clone()).collect();
+
+        for pane_group in pane_groups {
+            if pane_group.id() == active_pane_group_id {
+                continue;
+            }
+
+            let directories: Vec<WorkingDirectory> =
+                self.working_directories_model.read(ctx, |model, _| {
+                    model
+                        .most_recent_directories_for_pane_group(pane_group.id())
+                        .map(|dirs| dirs.collect())
+                        .unwrap_or_default()
+                });
+
+            if !directories.is_empty() {
+                return directories;
+            }
+
+            self.refresh_working_directories_for_pane_group(&pane_group, ctx);
+
+            let directories: Vec<WorkingDirectory> =
+                self.working_directories_model.read(ctx, |model, _| {
+                    model
+                        .most_recent_directories_for_pane_group(pane_group.id())
+                        .map(|dirs| dirs.collect())
+                        .unwrap_or_default()
+                });
+
+            if !directories.is_empty() {
+                return directories;
+            }
+        }
+
+        Vec::new()
+    }
+
     /// Opens the in-app network log pane as a right-split of the active pane
     /// group. If a pane already exists for the current window, refreshes its
     /// snapshot from the in-memory model and focuses it instead of opening
@@ -14410,9 +14455,24 @@ impl Workspace {
                 is_unsupported_session,
                 has_remote_server,
             );
+            #[cfg(feature = "local_fs")]
+            let project_explorer_fallback_directories = if is_pre_session_cloud_agent_composer {
+                self.local_project_explorer_fallback_directories_for_pane_group(
+                    pane_group_handle.id(),
+                    ctx,
+                )
+            } else {
+                Vec::new()
+            };
 
             self.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.update_coding_panel_enablement(enablement, ctx);
+                #[cfg(feature = "local_fs")]
+                left_panel.set_project_explorer_directory_fallback(
+                    is_pre_session_cloud_agent_composer,
+                    project_explorer_fallback_directories,
+                    ctx,
+                );
             });
 
             #[cfg(feature = "local_fs")]
@@ -14435,6 +14495,8 @@ impl Workspace {
 
             self.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.update_coding_panel_enablement(enablement, ctx);
+                #[cfg(feature = "local_fs")]
+                left_panel.set_project_explorer_directory_fallback(false, Vec::new(), ctx);
             });
 
             #[cfg(feature = "local_fs")]

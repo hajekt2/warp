@@ -170,6 +170,12 @@ pub struct LeftPanelView {
     active_view: active_view_state::ActiveViewState,
     toolbelt_buttons: Vec<ToolbeltButtonConfig>,
     active_pane_group: Option<WeakViewHandle<PaneGroup>>,
+    /// When the active pane group is a pre-session cloud-agent composer it has no local terminal
+    /// CWD of its own, but the left panel should still expose the user's local workspace. In that
+    /// case the workspace layer provides local roots from another pane group as a display-only
+    /// fallback. This flag lets later working-directory events from those local tabs keep the
+    /// Project Explorer populated until the composer becomes a real remote session.
+    use_project_explorer_directory_fallback: bool,
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     working_directories_model: ModelHandle<WorkingDirectoriesModel>,
     is_agent_management_view_open: bool,
@@ -265,39 +271,29 @@ impl LeftPanelView {
                 let Some(active_pane_group) = active_pane_group.upgrade(ctx) else {
                     return;
                 };
-                if active_pane_group.id() != *pane_group_id {
+                let active_pane_group_id = active_pane_group.id();
+                if active_pane_group_id != *pane_group_id {
+                    if me.use_project_explorer_directory_fallback {
+                        let active_directories_empty =
+                            me.working_directories_model.read(ctx, |model, _| {
+                                model
+                                    .most_recent_directories_for_pane_group(active_pane_group_id)
+                                    .map(|dirs| dirs.count() == 0)
+                                    .unwrap_or(true)
+                            });
+
+                        if active_directories_empty && !directories.is_empty() {
+                            me.update_roots_for_pane_group(
+                                active_pane_group,
+                                directories.clone(),
+                                ctx,
+                            );
+                        }
+                    }
                     return;
                 }
-                let has_terminal_session = directories.iter().any(|dir| dir.terminal_id.is_some());
 
-                // Update GlobalSearchView root directories based on all working directories
-                let roots: Vec<PathBuf> = directories.iter().map(|d| d.path.clone()).collect();
-
-                let global_search_view =
-                    me.get_or_create_global_search_view_for_pane_group(active_pane_group.id(), ctx);
-                global_search_view.update(ctx, |view, view_ctx| {
-                    view.set_root_directories(roots, view_ctx);
-                });
-
-                let directories: Vec<PathBuf> =
-                    directories.iter().map(|dir| dir.path.clone()).collect();
-
-                // Directories are already in display order (most recent first) from the model
-                let directories = deduplicate_by_directory_name(directories);
-                let file_tree_view =
-                    me.get_or_create_file_tree_view_for_pane_group(active_pane_group.id(), ctx);
-
-                let is_visible =
-                    active_pane_group.as_ref(ctx).left_panel_open && me.is_file_tree_active();
-                file_tree_view.update(ctx, |view, ctx| {
-                    view.set_root_directories(directories, ctx);
-                    view.set_has_terminal_session(has_terminal_session, ctx);
-                    view.set_is_active(is_visible, ctx);
-
-                    if is_visible {
-                        view.auto_expand_to_most_recent_directory(ctx);
-                    }
-                });
+                me.update_roots_for_pane_group(active_pane_group, directories.clone(), ctx);
                 ctx.notify();
             }
         });
@@ -311,6 +307,7 @@ impl LeftPanelView {
             active_view: active_view_state::new(active_view),
             toolbelt_buttons,
             active_pane_group: None,
+            use_project_explorer_directory_fallback: false,
             working_directories_model,
             is_agent_management_view_open: false,
             panel_position: super::PanelPosition::Left,
@@ -572,6 +569,7 @@ impl LeftPanelView {
             .map(|pane_group| pane_group.id());
 
         self.active_pane_group = Some(pane_group.downgrade());
+        self.use_project_explorer_directory_fallback = false;
 
         if let Some(previous_pane_group_id) = previous_pane_group_id {
             if previous_pane_group_id != pane_group_id {
@@ -587,11 +585,58 @@ impl LeftPanelView {
                     .map(|dirs| dirs.collect())
                     .unwrap_or_default()
             });
+        self.update_roots_for_pane_group(pane_group.clone(), active_directories, ctx);
+
+        let left_panel_open = pane_group.as_ref(ctx).left_panel_open;
+        self.on_left_panel_visibility_changed(left_panel_open, ctx);
+
+        ctx.notify();
+    }
+
+    pub fn set_project_explorer_directory_fallback(
+        &mut self,
+        enabled: bool,
+        fallback_directories: Vec<WorkingDirectory>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.use_project_explorer_directory_fallback = enabled;
+
+        if !enabled || fallback_directories.is_empty() {
+            return;
+        }
+
+        let Some(active_pane_group) = &self.active_pane_group else {
+            return;
+        };
+        let Some(active_pane_group) = active_pane_group.upgrade(ctx) else {
+            return;
+        };
+        let active_pane_group_id = active_pane_group.id();
+        let active_directories_empty = self.working_directories_model.read(ctx, |model, _| {
+            model
+                .most_recent_directories_for_pane_group(active_pane_group_id)
+                .map(|dirs| dirs.count() == 0)
+                .unwrap_or(true)
+        });
+
+        if active_directories_empty {
+            self.update_roots_for_pane_group(active_pane_group, fallback_directories, ctx);
+            ctx.notify();
+        }
+    }
+
+    fn update_roots_for_pane_group(
+        &mut self,
+        pane_group: ViewHandle<PaneGroup>,
+        active_directories: Vec<WorkingDirectory>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let pane_group_id = pane_group.id();
         let has_terminal_session = active_directories
             .iter()
             .any(|dir| dir.terminal_id.is_some());
 
-        // Update GlobalSearchView root directories based on all working directories
+        // Update GlobalSearchView root directories based on all working directories.
         let roots: Vec<PathBuf> = active_directories.iter().map(|d| d.path.clone()).collect();
         let global_search_view =
             self.get_or_create_global_search_view_for_pane_group(pane_group_id, ctx);
@@ -619,10 +664,6 @@ impl LeftPanelView {
                 view.auto_expand_to_most_recent_directory(ctx);
             }
         });
-
-        self.on_left_panel_visibility_changed(left_panel_open, ctx);
-
-        ctx.notify();
     }
 
     pub fn update_coding_panel_enablement(
