@@ -6540,10 +6540,14 @@ impl TerminalView {
     /// Returns whether or not the active session is a local session.  Returns
     /// None if there is no active session.
     pub fn active_session_is_local<C: ModelAsRef>(&self, ctx: &C) -> Option<bool> {
-        // Ensure shared session viewers and conversation transcript viewers are not
-        // considered local, even if the session hasn't been joined yet.
+        // Ensure shared session viewers and conversation transcript viewers are not considered
+        // local, even if the session hasn't been joined yet. Workspace UI can layer narrower
+        // pre-session exceptions without changing core input/session routing.
         let model = self.model.lock();
-        if model.is_shared_session_viewer() || model.is_conversation_transcript_viewer() {
+        if model.is_shared_session_viewer() {
+            return Some(false);
+        }
+        if model.is_conversation_transcript_viewer() {
             return Some(false);
         }
         drop(model);
@@ -6552,6 +6556,11 @@ impl TerminalView {
             let current_session = self.sessions.as_ref(ctx).get(session_id)?;
             Some(current_session.is_local())
         })
+    }
+
+    pub fn is_pre_session_cloud_agent_composer(&self) -> bool {
+        let model = self.model.lock();
+        model.is_dummy_cloud_mode_session() && model.shared_session_status().is_view_pending()
     }
 
     /// Returns the active session's launch shell, if it is specified.
@@ -25024,6 +25033,17 @@ impl TypedActionView for TerminalView {
                         });
                     }
                     self.tag_in_agent_for_user_long_running_command(ctx);
+                } else if FeatureFlag::AgentView.is_enabled()
+                    && AISettings::as_ref(ctx).is_local_agent_entrypoint_enabled(ctx)
+                    && !(self.is_ambient_agent_session(ctx) && !self.is_nested_cloud_mode(ctx))
+                {
+                    self.enter_agent_view_for_new_conversation(
+                        None,
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        },
+                        ctx,
+                    );
                 } else {
                     self.input.update(ctx, |input, ctx| {
                         input.set_input_mode_agent(false, ctx);
@@ -26233,7 +26253,7 @@ impl View for TerminalView {
             context.set.insert(flags::HAS_PENDING_PROMPT_SUGGESTION);
         }
 
-        if AISettings::as_ref(app).is_any_ai_enabled(app) {
+        if AISettings::as_ref(app).is_local_agent_entrypoint_enabled(app) {
             context.set.insert(flags::IS_ANY_AI_ENABLED);
         }
 

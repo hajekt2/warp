@@ -1,6 +1,7 @@
 use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use futures::channel::oneshot;
+use warp_acp::{McpServer, McpServerSse, McpServerStdio, SessionUpdate};
 use warp_cli::agent::Harness;
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -9,9 +10,9 @@ use warp_cli::{
 use warp_core::channel::ChannelState;
 
 use super::{
-    IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
-    LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    AcpStreamingOutputBuilder, AgentDriver, IdleTimeoutSender,
+    LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV, LEGACY_OZ_PARENT_STATE_ROOT_ENV,
+    OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
 use crate::ai::agent::{
     task::TaskId, AIAgentActionResult, AIAgentActionResultType, AIAgentInput, AIAgentOutput,
@@ -107,6 +108,139 @@ fn test_normalize_sse_server_with_headers() {
         server["headers"]["Authorization"].as_str().unwrap(),
         "Bearer token"
     );
+}
+
+#[test]
+fn acp_mcp_explicit_stdio_allowlist_entry_parses_as_argv() {
+    let server = AgentDriver::parse_acp_mcp_server("local-tools | /bin/echo hello world")
+        .expect("explicit ACP MCP allowlist entry should parse");
+
+    let McpServer::Stdio(server) = server else {
+        panic!("expected stdio MCP server");
+    };
+    assert_eq!(server.name, "local-tools");
+    assert_eq!(server.command, std::path::PathBuf::from("/bin/echo"));
+    assert_eq!(server.args, &["hello", "world"]);
+}
+
+#[test]
+fn acp_mcp_bare_allowlist_entry_is_reserved_for_installed_servers() {
+    assert!(AgentDriver::parse_acp_mcp_server("installed-server-name").is_none());
+    assert!(AgentDriver::parse_acp_mcp_server("*").is_none());
+}
+
+#[test]
+fn acp_mcp_capability_filter_gates_non_stdio_transports() {
+    let servers = vec![
+        McpServer::Stdio(McpServerStdio::new("stdio", "/bin/echo")),
+        McpServer::Sse(McpServerSse::new("sse", "https://example.test/sse")),
+    ];
+
+    let filtered = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
+        servers.clone(),
+        &serde_json::json!({"mcpCapabilities":{"sse": false}}),
+    );
+    assert_eq!(filtered.len(), 1);
+    assert!(matches!(filtered[0], McpServer::Stdio(_)));
+
+    let filtered = AgentDriver::filter_acp_mcp_servers_for_agent_capabilities(
+        servers,
+        &serde_json::json!({"mcpCapabilities":{"sse": true}}),
+    );
+    assert_eq!(filtered.len(), 2);
+}
+
+#[test]
+fn acp_auth_method_prefers_method_id() {
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[
+            serde_json::json!({"methodId":"env-openai-api-key"}),
+            serde_json::json!({"id":"fallback"}),
+        ]),
+        Some("env-openai-api-key".to_string())
+    );
+}
+
+#[test]
+fn acp_auth_method_skips_interactive_login_methods() {
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[
+            serde_json::json!({
+                "id": "opencode-login",
+                "name": "Login with opencode",
+                "description": "Run `opencode auth login` in the terminal"
+            }),
+            serde_json::json!({"methodId":"env-openai-api-key"}),
+        ]),
+        Some("env-openai-api-key".to_string())
+    );
+
+    assert_eq!(
+        AgentDriver::preferred_acp_auth_method(&[serde_json::json!({
+            "id": "opencode-login",
+            "name": "Login with opencode",
+            "description": "Run `opencode auth login` in the terminal"
+        })]),
+        None
+    );
+}
+
+#[test]
+fn acp_streaming_output_builder_maps_structured_updates_to_warp_messages() {
+    let mut builder = AcpStreamingOutputBuilder::default();
+
+    assert!(builder.apply_update(SessionUpdate::AgentThoughtChunk {
+        text: "thinking".to_string(),
+    }));
+    assert!(builder.apply_update(SessionUpdate::AgentMessageChunk {
+        text: "hello".to_string(),
+    }));
+    assert!(builder.apply_update(SessionUpdate::ToolCall {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        args: serde_json::json!({"path":"README.md"}),
+    }));
+    assert!(builder.apply_update(SessionUpdate::Plan {
+        content: "1. Ship it".to_string(),
+    }));
+    assert!(!builder.apply_update(SessionUpdate::Unknown {
+        method: "future".to_string(),
+        params: serde_json::json!({"sessionUpdate":"future"}),
+    }));
+
+    let output = builder.output();
+
+    assert!(output
+        .text_from_agent_reasoning()
+        .any(|text| agent_text_contains(text, "thinking")));
+    assert!(output
+        .text_from_agent_output()
+        .any(|text| agent_text_contains(text, "hello")));
+    assert!(output.actions().any(|action| {
+        matches!(
+            &action.action,
+            crate::ai::agent::AIAgentActionType::CallMCPTool { name, .. } if name == "read_file"
+        )
+    }));
+    assert!(output
+        .text_from_agent_output()
+        .any(|text| agent_text_contains(text, "Ship it")));
+}
+
+fn agent_text_contains(text: &crate::ai::agent::AIAgentText, needle: &str) -> bool {
+    text.sections.iter().any(|section| match section {
+        crate::ai::agent::AIAgentTextSection::PlainText { text } => text.text().contains(needle),
+        crate::ai::agent::AIAgentTextSection::Code { code, .. } => code.contains(needle),
+        crate::ai::agent::AIAgentTextSection::Table { table } => {
+            table.markdown_source.contains(needle)
+        }
+        crate::ai::agent::AIAgentTextSection::Image { image } => {
+            image.markdown_source.contains(needle)
+        }
+        crate::ai::agent::AIAgentTextSection::MermaidDiagram { diagram } => {
+            diagram.markdown_source.contains(needle)
+        }
+    })
 }
 
 // ── IdleTimeoutSender tests ──────────────────────────────────────────────────────

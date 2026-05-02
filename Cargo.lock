@@ -14380,6 +14380,7 @@ dependencies = [
  "walkdir",
  "warp-command-signatures",
  "warp-workflows",
+ "warp_acp",
  "warp_cli",
  "warp_completer",
  "warp_core",
@@ -14463,6 +14464,23 @@ version = "0.1.0"
 source = "git+https://github.com/warpdotdev/workflows?rev=793a98ddda6ef19682aed66364faebd2829f0e01#793a98ddda6ef19682aed66364faebd2829f0e01"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "warp_acp"
+version = "0.1.0"
+dependencies = [
+ "command",
+ "futures",
+ "instant",
+ "log",
+ "reqwest",
+ "rustls 0.23.39",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "websocket",
 ]
 
 [[package]]

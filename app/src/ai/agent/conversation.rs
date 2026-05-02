@@ -3,6 +3,7 @@ use crate::ai::agent::linearization::compute_task_depths;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::{RequestInput, ResponseStreamId, SerializedBlockListItem};
+use crate::ai::llms::LLMId;
 use crate::ai::skills::SkillDescriptor;
 use crate::code_review::CodeReviewTelemetryEvent;
 use crate::notebooks::NotebookId;
@@ -46,12 +47,13 @@ use crate::{
                 failed_icon, gray_stop_icon, in_progress_icon, succeeded_icon, yellow_stop_icon,
             },
             todos::AIAgentTodoList,
-            AIAgentOutputMessage, AIAgentOutputMessageType, MessageToAIAgentOutputMessageError,
+            AIAgentOutputMessage, AIAgentOutputMessageType, AIAgentText, AIAgentTextSection,
+            AgentOutputText, MessageToAIAgentOutputMessageError,
         },
         blocklist::BlocklistAIHistoryEvent,
     },
     persistence::{
-        model::{AgentConversationData, PersistedAutoexecuteMode},
+        model::{AcpSessionResumeMetadata, AgentConversationData, PersistedAutoexecuteMode},
         ModelEvent,
     },
     ui_components::icons::Icon,
@@ -228,6 +230,9 @@ pub struct AIConversation {
     /// event log. Used on restore to resume event delivery without
     /// re-delivering already-processed events.
     last_event_sequence: Option<i64>,
+
+    /// Local ACP session metadata used to reload an agent-side session after restart.
+    acp_session_resume: Option<AcpSessionResumeMetadata>,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -278,6 +283,7 @@ impl AIConversation {
             parent_conversation_id: None,
             is_remote_child: false,
             last_event_sequence: None,
+            acp_session_resume: None,
         }
     }
 
@@ -359,6 +365,7 @@ impl AIConversation {
             run_id,
             autoexecute_override,
             last_event_sequence,
+            acp_session_resume,
         ) = if let Some(data) = conversation_data {
             let server_conversation_token = data
                 .server_conversation_token
@@ -391,6 +398,7 @@ impl AIConversation {
                 AIConversationAutoexecuteMode::default()
             };
             let last_event_sequence = data.last_event_sequence;
+            let acp_session_resume = data.acp_session_resume;
 
             (
                 server_conversation_token,
@@ -405,6 +413,7 @@ impl AIConversation {
                 run_id,
                 autoexecute_override,
                 last_event_sequence,
+                acp_session_resume,
             )
         } else {
             (
@@ -419,6 +428,7 @@ impl AIConversation {
                 false,
                 None,
                 AIConversationAutoexecuteMode::default(),
+                None,
                 None,
             )
         };
@@ -463,6 +473,7 @@ impl AIConversation {
             parent_conversation_id,
             is_remote_child,
             last_event_sequence,
+            acp_session_resume,
         })
     }
 
@@ -706,6 +717,14 @@ impl AIConversation {
 
     pub fn server_conversation_token(&self) -> Option<&ServerConversationToken> {
         self.server_conversation_token.as_ref()
+    }
+
+    pub fn acp_session_resume(&self) -> Option<&AcpSessionResumeMetadata> {
+        self.acp_session_resume.as_ref()
+    }
+
+    pub(crate) fn set_acp_session_resume(&mut self, metadata: Option<AcpSessionResumeMetadata>) {
+        self.acp_session_resume = metadata;
     }
 
     /// Returns the server-assigned run identifier as a string.
@@ -2614,6 +2633,231 @@ impl AIConversation {
             .ok_or(UpdateConversationError::ExchangeNotFound)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_streaming_text_exchange(
+        &mut self,
+        input: Vec<AIAgentInput>,
+        initial_output_text: String,
+        working_directory: Option<String>,
+        model_id: LLMId,
+        coding_model_id: LLMId,
+        cli_agent_model_id: LLMId,
+        computer_use_model_id: LLMId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(AIAgentExchangeId, MessageId), UpdateConversationError> {
+        let exchange_id = AIAgentExchangeId::new();
+        let message_id = MessageId::new(Uuid::new_v4().to_string());
+        let task_id = self.get_root_task_id().clone();
+        let output = AIAgentOutput {
+            messages: vec![AIAgentOutputMessage::text(
+                message_id.clone(),
+                AIAgentText {
+                    sections: vec![AIAgentTextSection::PlainText {
+                        text: AgentOutputText::from(initial_output_text),
+                    }],
+                },
+            )],
+            ..Default::default()
+        };
+        let now = Local::now();
+        let exchange = AIAgentExchange {
+            id: exchange_id,
+            input,
+            output_status: AIAgentOutputStatus::Streaming {
+                output: Some(Shared::new(output)),
+            },
+            added_message_ids: HashSet::new(),
+            start_time: now,
+            finish_time: None,
+            time_to_first_token_ms: None,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            request_cost: None,
+            response_initiator: None,
+        };
+        self.append_exchange_to_task(&task_id, exchange)?;
+        ctx.emit(BlocklistAIHistoryEvent::AppendedExchange {
+            exchange_id,
+            task_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+            response_stream_id: None,
+        });
+        Ok((exchange_id, message_id))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_streaming_text_exchange(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        message_id: &MessageId,
+        output_text: String,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming {
+            output: Some(output),
+        } = &exchange.output_status
+        else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        let mut output = output.get_mut();
+        if let Some(message) = output
+            .messages
+            .iter_mut()
+            .find(|message| &message.id == message_id)
+        {
+            message.message = AIAgentOutputMessageType::Text(AIAgentText {
+                sections: vec![AIAgentTextSection::PlainText {
+                    text: AgentOutputText::from(output_text),
+                }],
+            });
+        } else {
+            output.messages.push(AIAgentOutputMessage::text(
+                message_id.clone(),
+                AIAgentText {
+                    sections: vec![AIAgentTextSection::PlainText {
+                        text: AgentOutputText::from(output_text),
+                    }],
+                },
+            ));
+        }
+        drop(output);
+        let conversation_id = self.id;
+        let is_hidden = self.is_exchange_hidden(exchange_id);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn replace_streaming_exchange_output(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        output: AIAgentOutput,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming {
+            output: Some(streaming_output),
+        } = &exchange.output_status
+        else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        *streaming_output.get_mut() = output;
+
+        let conversation_id = self.id;
+        let is_hidden = self.is_exchange_hidden(exchange_id);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish_streaming_text_exchange(
+        &mut self,
+        exchange_id: AIAgentExchangeId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
+        let exchange = self.get_exchange_to_update(exchange_id)?;
+        let AIAgentOutputStatus::Streaming { output } = &exchange.output_status else {
+            return Err(UpdateConversationError::OutputAlreadyFinished);
+        };
+        let Some(output) = output.as_ref().map(Shared::get_owned) else {
+            return Err(UpdateConversationError::OutputNeverInitialized);
+        };
+        exchange.output_status = AIAgentOutputStatus::Finished {
+            finished_output: FinishedAIAgentOutput::Success { output },
+        };
+        exchange.finish_time = Some(Local::now());
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: self.is_exchange_hidden(exchange_id),
+        });
+        self.write_updated_conversation_state(ctx);
+        self.update_status(ConversationStatus::Success, terminal_view_id, ctx);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_finished_text_exchange(
+        &mut self,
+        input: Vec<AIAgentInput>,
+        output_text: String,
+        working_directory: Option<String>,
+        model_id: LLMId,
+        coding_model_id: LLMId,
+        cli_agent_model_id: LLMId,
+        computer_use_model_id: LLMId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<AIAgentExchangeId, UpdateConversationError> {
+        let exchange_id = AIAgentExchangeId::new();
+        let task_id = self.get_root_task_id().clone();
+        let output = AIAgentOutput {
+            messages: vec![AIAgentOutputMessage::text(
+                MessageId::new(Uuid::new_v4().to_string()),
+                api::message::AgentOutput { text: output_text }.into(),
+            )],
+            ..Default::default()
+        };
+        let now = Local::now();
+        let exchange = AIAgentExchange {
+            id: exchange_id,
+            input,
+            output_status: AIAgentOutputStatus::Finished {
+                finished_output: FinishedAIAgentOutput::Success {
+                    output: Shared::new(output),
+                },
+            },
+            added_message_ids: HashSet::new(),
+            start_time: now,
+            finish_time: Some(now),
+            time_to_first_token_ms: None,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            request_cost: None,
+            response_initiator: None,
+        };
+
+        self.append_exchange_to_task(&task_id, exchange)?;
+        ctx.emit(BlocklistAIHistoryEvent::AppendedExchange {
+            exchange_id,
+            task_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+            response_stream_id: None,
+        });
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id,
+            terminal_view_id,
+            conversation_id: self.id,
+            is_hidden: false,
+        });
+        self.update_status(ConversationStatus::Success, terminal_view_id, ctx);
+        Ok(exchange_id)
+    }
+
     pub fn get_root_task(&self) -> Option<&Task> {
         self.task_store.root_task()
     }
@@ -2846,6 +3090,7 @@ impl AIConversation {
                 run_id: self.task_id.map(|id| id.to_string()),
                 autoexecute_override: Some(self.autoexecute_override.into()),
                 last_event_sequence: self.last_event_sequence,
+                acp_session_resume: self.acp_session_resume.clone(),
             },
         };
         ctx.spawn(

@@ -4,6 +4,7 @@ use crate::{
     test_util::settings::initialize_settings_for_tests,
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::{App, SingletonEntity};
 
@@ -347,6 +348,357 @@ fn test_toolbar_command_map_roundtrip() {
     let file_value = original.to_file_value();
     let restored = ToolbarCommandMap::from_file_value(&file_value).unwrap();
     assert_eq!(original, restored);
+}
+
+#[test]
+fn test_acp_agent_registry_contains_seed_agents() {
+    let opencode = KNOWN_ACP_AGENTS
+        .iter()
+        .find(|entry| entry.registry_key == "opencode")
+        .expect("opencode ACP registry entry exists");
+    assert_eq!(opencode.command.command, "opencode");
+    assert_eq!(opencode.command.args, &["acp", "--port", "0"]);
+
+    let codex = KNOWN_ACP_AGENTS
+        .iter()
+        .find(|entry| entry.registry_key == "codex-acp")
+        .expect("codex ACP registry entry exists");
+    assert_eq!(codex.command.command, "codex-acp");
+    assert_eq!(codex.command.args, &[] as &[&str]);
+    assert_eq!(
+        codex.fallback_command,
+        Some(AcpAgentCommandTemplate {
+            command: "npx",
+            args: &["-y", "@zed-industries/codex-acp"],
+        })
+    );
+}
+
+#[test]
+fn test_acp_agent_config_roundtrip() {
+    use settings_value::SettingsValue;
+
+    let original = AcpAgentConfig {
+        id: AcpAgentId::new("opencode-local"),
+        name: "OpenCode".to_string(),
+        command: "opencode".to_string(),
+        transport: AcpAgentTransportConfig::Local,
+        args: vec!["acp".to_string()],
+        env: vec![AcpAgentEnvVar {
+            name: "OPENCODE_CONFIG".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "opencode-config".to_string(),
+            },
+        }],
+        mcp_allowlist: vec!["mcp-server-1".to_string()],
+        install_url: Some("https://opencode.ai".to_string()),
+        registry_key: Some("opencode".to_string()),
+        local_confirmation: AcpAgentLocalConfirmation {
+            confirmed_on_this_device: true,
+            confirmed_at: Some("2026-04-29T21:00:00Z".to_string()),
+        },
+    };
+
+    let file_value = original.to_file_value();
+    let restored = AcpAgentConfig::from_file_value(&file_value).unwrap();
+    assert_eq!(original, restored);
+}
+
+#[derive(Default)]
+struct TestSecureStorage {
+    values: HashMap<String, String>,
+}
+
+impl TestSecureStorage {
+    fn new(values: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+        Self {
+            values: values
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+}
+
+impl warpui_extras::secure_storage::SecureStorage for TestSecureStorage {
+    fn write_value(
+        &self,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), warpui_extras::secure_storage::Error> {
+        Ok(())
+    }
+
+    fn read_value(&self, key: &str) -> Result<String, warpui_extras::secure_storage::Error> {
+        self.values
+            .get(key)
+            .cloned()
+            .ok_or(warpui_extras::secure_storage::Error::NotFound)
+    }
+
+    fn remove_value(&self, _key: &str) -> Result<(), warpui_extras::secure_storage::Error> {
+        Ok(())
+    }
+}
+
+fn remote_acp_config_with_header(header: AcpAgentHttpHeader) -> AcpAgentConfig {
+    AcpAgentConfig {
+        id: AcpAgentId::new("remote-agent"),
+        name: "Remote Agent".to_string(),
+        command: String::new(),
+        transport: AcpAgentTransportConfig::Http {
+            url: "https://remote.example/acp".to_string(),
+            headers: vec![header],
+        },
+        args: Vec::new(),
+        env: Vec::new(),
+        mcp_allowlist: Vec::new(),
+        install_url: None,
+        registry_key: None,
+        local_confirmation: AcpAgentLocalConfirmation::default(),
+    }
+}
+
+#[test]
+fn to_agent_connection_resolves_secret_ref_headers() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| -> warpui_extras::secure_storage::Model {
+                Box::new(TestSecureStorage::new([(
+                    "my-token",
+                    "Bearer resolved-token",
+                )]))
+            });
+        });
+
+        let config = remote_acp_config_with_header(AcpAgentHttpHeader {
+            name: "Authorization".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "my-token".to_string(),
+            },
+        });
+
+        app.read(|ctx| {
+            let connection = config
+                .to_agent_connection(ctx)
+                .expect("secret header should materialize");
+            let warp_acp::AcpAgentConnection::Http { endpoint } = connection else {
+                panic!("expected HTTP ACP connection");
+            };
+            assert_eq!(endpoint.headers.len(), 1);
+            assert_eq!(endpoint.headers[0].name, "Authorization");
+            assert_eq!(endpoint.headers[0].value, "Bearer resolved-token");
+        });
+    });
+}
+
+#[test]
+fn to_agent_connection_returns_missing_secret_error() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| -> warpui_extras::secure_storage::Model {
+                Box::new(TestSecureStorage::default())
+            });
+        });
+
+        let config = remote_acp_config_with_header(AcpAgentHttpHeader {
+            name: "Authorization".to_string(),
+            value: AcpAgentEnvValue::SecretRef {
+                key: "missing-token".to_string(),
+            },
+        });
+
+        app.read(|ctx| {
+            let error = config
+                .to_agent_connection(ctx)
+                .expect_err("missing secret should return structured error");
+            assert!(matches!(
+                error,
+                AcpAgentConnectionError::MissingSecret { ref key } if key == "missing-token"
+            ));
+            assert!(error
+                .to_string()
+                .contains("configure missing secret: missing-token"));
+        });
+    });
+}
+
+#[test]
+fn acp_agent_http_header_debug_redacts_secret_values() {
+    let header = AcpAgentHttpHeader {
+        name: "Authorization".to_string(),
+        value: AcpAgentEnvValue::Literal {
+            value: "Bearer literal-token".to_string(),
+        },
+    };
+
+    let debug = format!("{header:?}");
+    assert!(debug.contains("Authorization"));
+    assert!(!debug.contains("literal-token"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn test_configured_acp_agents_are_feature_gated() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let config = AcpAgentConfig::from_registry_entry(&KNOWN_ACP_AGENTS[0]);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .acp_agent_configs
+                .set_value(vec![config.clone()], ctx)
+                .unwrap();
+        });
+
+        let _disabled = FeatureFlag::AcpClient.override_enabled(false);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.configured_acp_agents().is_empty());
+            assert!(AISettings::known_acp_agent_registry().is_empty());
+        });
+        drop(_disabled);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(
+                settings.configured_acp_agents(),
+                std::slice::from_ref(&config)
+            );
+            assert_eq!(
+                settings.acp_agent_config(&AcpAgentId::new("opencode")),
+                Some(&config)
+            );
+            assert!(!AISettings::known_acp_agent_registry().is_empty());
+        });
+    });
+}
+
+#[test]
+fn test_configured_acp_agents_enable_local_agent_entrypoints() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(!settings.has_configured_local_acp_agents());
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.has_configured_local_acp_agents());
+        });
+    });
+}
+
+#[test]
+fn test_add_and_remove_acp_agent_from_registry() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(settings.configured_acp_agents().len(), 1);
+            assert_eq!(
+                settings.configured_acp_agents()[0].id,
+                AcpAgentId::new("opencode")
+            );
+            assert_eq!(
+                settings.configured_acp_agents()[0].args,
+                &["acp", "--port", "0"]
+            );
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.remove_acp_agent_config(&AcpAgentId::new("opencode"), ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(settings.configured_acp_agents().is_empty());
+        });
+    });
+}
+
+#[test]
+fn test_add_custom_acp_agent_config_generates_unique_local_ids() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_custom_acp_agent_config(
+                "My Local Agent",
+                "custom-acp",
+                vec!["--stdio".to_string()],
+                ctx,
+            );
+            settings.add_custom_acp_agent_config("My Local Agent", "custom-acp", Vec::new(), ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let configs = settings.configured_acp_agents();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(configs[0].id, AcpAgentId::new("my-local-agent"));
+            assert_eq!(configs[0].args, &["--stdio"]);
+            assert_eq!(configs[1].id, AcpAgentId::new("my-local-agent-2"));
+            assert!(configs[0].local_confirmation.confirmed_on_this_device);
+        });
+    });
+}
+
+#[test]
+fn test_upsert_acp_agent_config_replaces_existing_agent() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_custom_acp_agent_config("Local Agent", "old-acp", Vec::new(), ctx);
+            settings.upsert_acp_agent_config(
+                AcpAgentConfig {
+                    id: AcpAgentId::new("local-agent"),
+                    name: "Local Agent Updated".to_string(),
+                    command: "new-acp".to_string(),
+                    transport: AcpAgentTransportConfig::Local,
+                    args: vec!["--stdio".to_string()],
+                    env: vec![AcpAgentEnvVar {
+                        name: "TOKEN".to_string(),
+                        value: AcpAgentEnvValue::SecretRef {
+                            key: "token".to_string(),
+                        },
+                    }],
+                    mcp_allowlist: vec!["server-uuid".to_string()],
+                    install_url: Some("https://example.test".to_string()),
+                    registry_key: None,
+                    local_confirmation: AcpAgentLocalConfirmation {
+                        confirmed_on_this_device: true,
+                        confirmed_at: None,
+                    },
+                },
+                ctx,
+            );
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let configs = settings.configured_acp_agents();
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].name, "Local Agent Updated");
+            assert_eq!(configs[0].command, "new-acp");
+            assert_eq!(configs[0].args, &["--stdio"]);
+            assert_eq!(configs[0].mcp_allowlist, &["server-uuid"]);
+            assert!(matches!(
+                configs[0].env[0].value,
+                AcpAgentEnvValue::SecretRef { .. }
+            ));
+        });
+    });
 }
 
 #[test]

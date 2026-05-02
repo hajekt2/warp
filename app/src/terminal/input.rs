@@ -6046,6 +6046,27 @@ impl Input {
             })
     }
 
+    fn is_configuring_configured_acp_agent(&self, app: &AppContext) -> bool {
+        self.ambient_agent_view_model()
+            .is_some_and(|ambient_agent_model| {
+                let ambient_agent_model = ambient_agent_model.as_ref(app);
+                ambient_agent_model.is_configuring_ambient_agent()
+                    && ambient_agent_model
+                        .selected_harness_selection()
+                        .acp_agent_id()
+                        .is_some_and(|id| AISettings::as_ref(app).acp_agent_config(id).is_some())
+            })
+    }
+
+    fn current_working_dir_for_local_agent(&self) -> PathBuf {
+        self.active_block_metadata
+            .as_ref()
+            .and_then(BlockMetadata::current_working_directory)
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Try to execute a command in the local session that was
     /// requested by a shared session participant (sharer or viewer).
     ///
@@ -11980,9 +12001,11 @@ impl Input {
         } else if self.should_block_cloud_mode_setup_submission(ctx) {
             return;
         } else if FeatureFlag::AgentMode.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+            && (AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                || self.is_configuring_configured_acp_agent(ctx))
             && (self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
-                || self.is_cloud_mode_input_v2_composing(ctx))
+                || self.is_cloud_mode_input_v2_composing(ctx)
+                || self.is_configuring_configured_acp_agent(ctx))
         {
             // If we're submitting an AI query, we want to send telemetry for the input type.
             if FeatureFlag::NldImprovements.is_enabled() {
@@ -12089,9 +12112,15 @@ impl Input {
                     context_model.clear_pending_attachments(ctx);
                 });
 
+                let is_local_acp_agent = self.is_configuring_configured_acp_agent(ctx);
+                let working_dir = self.current_working_dir_for_local_agent();
                 if let Some(ambient_agent_view_model) = self.ambient_agent_view_model() {
                     ambient_agent_view_model.update(ctx, |state, ctx| {
-                        state.spawn_agent(prompt, attachments, ctx);
+                        if is_local_acp_agent {
+                            state.spawn_local_acp_agent(prompt, attachments, working_dir, ctx);
+                        } else {
+                            state.spawn_agent(prompt, attachments, ctx);
+                        }
                     });
                 }
                 return;
@@ -14399,7 +14428,7 @@ impl View for Input {
             ctx.set.insert(flags::EMPTY_INPUT_BUFFER);
         }
 
-        if ai_settings.is_any_ai_enabled(app) {
+        if ai_settings.is_local_agent_entrypoint_enabled(app) {
             ctx.set.insert(flags::IS_ANY_AI_ENABLED);
         }
 

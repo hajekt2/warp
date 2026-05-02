@@ -169,6 +169,7 @@ impl CLIAgent {
     pub fn from_harness(harness: Harness) -> Option<Self> {
         match harness {
             Harness::Oz => None,
+            Harness::Acp => None,
             Harness::Claude => Some(CLIAgent::Claude),
             Harness::Gemini => Some(CLIAgent::Gemini),
             Harness::OpenCode => Some(CLIAgent::OpenCode),

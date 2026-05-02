@@ -134,6 +134,9 @@ pub enum Harness {
     /// Delegate to the `gemini` CLI.
     #[value(name = "gemini")]
     Gemini,
+    /// Use a configured Agent Client Protocol (ACP) agent.
+    #[value(name = "acp")]
+    Acp,
     /// Delegate to the `codex` CLI.
     #[value(name = "codex")]
     Codex,
@@ -154,8 +157,8 @@ impl Harness {
     pub fn parse_local_child_harness(value: &str) -> Option<Self> {
         match Self::parse_orchestration_harness(value) {
             Some(harness @ (Self::Claude | Self::OpenCode)) => Some(harness),
-            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Codex) | Some(Self::Unknown)
-            | None => None,
+            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Acp) | Some(Self::Codex)
+            | Some(Self::Unknown) | None => None,
         }
     }
 
@@ -165,6 +168,7 @@ impl Harness {
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
+            Self::Acp => "ACP",
             Self::Codex => "Codex",
             Self::Unknown => "Unknown",
         }
@@ -183,6 +187,7 @@ impl Harness {
             "claude" => Some(Harness::Claude),
             "opencode" => Some(Harness::OpenCode),
             "gemini" => Some(Harness::Gemini),
+            "acp" => Some(Harness::Acp),
             "codex" => Some(Harness::Codex),
             "unknown" => Some(Harness::Unknown),
             _ => None,
@@ -200,6 +205,7 @@ impl Harness {
             Harness::Claude => "claude",
             Harness::OpenCode => "opencode",
             Harness::Gemini => "gemini",
+            Harness::Acp => "acp",
             Harness::Codex => "codex",
             Harness::Unknown => "unknown",
         }

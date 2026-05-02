@@ -29,8 +29,9 @@ use crate::ai::agent::AIAgentExchangeId;
 use crate::ai::agent::CancellationReason;
 use crate::ai::artifacts::Artifact;
 use crate::ai::document::ai_document_model::AIDocumentModel;
+use crate::ai::llms::LLMPreferences;
 use crate::input_suggestions::HistoryOrder;
-use crate::persistence::model::AgentConversationData;
+use crate::persistence::model::{AcpSessionResumeMetadata, AgentConversationData};
 use crate::persistence::ModelEvent;
 use crate::server::server_api::ServerApiProvider;
 use crate::terminal::model::block::BlockId;
@@ -39,8 +40,9 @@ use crate::GlobalResourceHandlesProvider;
 use crate::{
     ai::agent::{
         conversation::{AIConversation, AIConversationId},
-        AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutputStatus, FinishedAIAgentOutput,
-        MessageId, RenderableAIError, RequestCost, Suggestions,
+        AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutput, AIAgentOutputStatus,
+        FinishedAIAgentOutput, MessageId, RenderableAIError, RequestCost, Suggestions,
+        UserQueryMode,
     },
     persistence::model::AgentConversation,
     ui_components::icons::Icon,
@@ -60,6 +62,14 @@ pub use conversation_loader::{
 };
 
 pub(super) const MAX_HISTORICAL_CONVERSATIONS: usize = 100;
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingExchangeHandle {
+    pub(crate) conversation_id: AIConversationId,
+    pub(crate) exchange_id: AIAgentExchangeId,
+    #[allow(dead_code)]
+    pub(crate) message_id: MessageId,
+}
 
 /// Metadata for conversations
 /// When created from local DB, has_local_data=true and server_metadata=None.
@@ -469,6 +479,33 @@ impl BlocklistAIHistoryModel {
         conversation.write_updated_conversation_state(ctx);
     }
 
+    #[doc(hidden)]
+    /// Returns persisted ACP session metadata for a live conversation, if present.
+    pub fn acp_session_resume_metadata(
+        &self,
+        conversation_id: AIConversationId,
+    ) -> Option<AcpSessionResumeMetadata> {
+        self.conversations_by_id
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.acp_session_resume().cloned())
+    }
+
+    #[doc(hidden)]
+    /// Updates the ACP session metadata stored alongside the conversation and
+    /// writes it through the normal conversation persistence path.
+    pub fn set_acp_session_resume_metadata(
+        &mut self,
+        conversation_id: AIConversationId,
+        metadata: AcpSessionResumeMetadata,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) else {
+            return;
+        };
+        conversation.set_acp_session_resume(Some(metadata));
+        conversation.write_updated_conversation_state(ctx);
+    }
+
     /// Sets a live conversation's server token, and updates the mapping in the history
     /// model.
     pub fn set_server_conversation_token_for_conversation(
@@ -790,6 +827,231 @@ impl BlocklistAIHistoryModel {
         new_conversation_id
     }
 
+    // Streaming exchange API boundary:
+    //
+    // Keep these methods transport-agnostic. They exist for agent runtimes that
+    // emit incremental output before the final exchange is known (currently the
+    // agent SDK driver and local ACP's `session/update` notifications). Cloud
+    // Oz conversations that arrive as complete exchanges should continue to use
+    // the normal append-exchange path instead of extending this section with
+    // transport-specific entry points.
+    pub(crate) fn start_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        prompt: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<StreamingExchangeHandle, UpdateHistoryError> {
+        self.start_streaming_exchange_in_conversation(
+            terminal_view_id,
+            None,
+            prompt,
+            working_directory,
+            ctx,
+        )
+    }
+
+    pub(crate) fn start_streaming_exchange_in_conversation(
+        &mut self,
+        terminal_view_id: EntityId,
+        conversation_id: Option<AIConversationId>,
+        prompt: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<StreamingExchangeHandle, UpdateHistoryError> {
+        let conversation_id = conversation_id
+            .filter(|conversation_id| self.conversations_by_id.contains_key(conversation_id))
+            .unwrap_or_else(|| self.start_new_conversation(terminal_view_id, false, false, ctx));
+        self.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
+
+        let llm_prefs = LLMPreferences::as_ref(ctx);
+        let model_id = llm_prefs
+            .get_active_base_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let coding_model_id = llm_prefs
+            .get_active_coding_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let cli_agent_model_id = llm_prefs
+            .get_active_cli_agent_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let computer_use_model_id = llm_prefs
+            .get_active_computer_use_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+
+        let input = vec![AIAgentInput::UserQuery {
+            query: prompt,
+            context: Default::default(),
+            static_query_type: None,
+            referenced_attachments: Default::default(),
+            user_query_mode: UserQueryMode::default(),
+            running_command: None,
+            intended_agent: None,
+        }];
+
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        let (exchange_id, message_id) = conversation.append_streaming_text_exchange(
+            input,
+            String::new(),
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(StreamingExchangeHandle {
+            conversation_id,
+            exchange_id,
+            message_id,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &StreamingExchangeHandle,
+        output_text: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.update_streaming_text_exchange(
+            handle.exchange_id,
+            &handle.message_id,
+            output_text,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn update_streaming_exchange_output(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &StreamingExchangeHandle,
+        output: AIAgentOutput,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.replace_streaming_exchange_output(
+            handle.exchange_id,
+            output,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn finish_streaming_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &StreamingExchangeHandle,
+        output_text: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        self.update_streaming_exchange(terminal_view_id, handle, output_text, ctx)?;
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.finish_streaming_text_exchange(handle.exchange_id, terminal_view_id, ctx)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_streaming_exchange_current_output(
+        &mut self,
+        terminal_view_id: EntityId,
+        handle: &StreamingExchangeHandle,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&handle.conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(
+                handle.conversation_id,
+            ))?;
+        conversation.finish_streaming_text_exchange(handle.exchange_id, terminal_view_id, ctx)?;
+        Ok(())
+    }
+
+    pub fn append_finished_text_exchange(
+        &mut self,
+        terminal_view_id: EntityId,
+        prompt: String,
+        output_text: String,
+        working_directory: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<AIConversationId, UpdateHistoryError> {
+        let conversation_id = self.start_new_conversation(terminal_view_id, false, false, ctx);
+        self.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
+
+        let llm_prefs = LLMPreferences::as_ref(ctx);
+        let model_id = llm_prefs
+            .get_active_base_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let coding_model_id = llm_prefs
+            .get_active_coding_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let cli_agent_model_id = llm_prefs
+            .get_active_cli_agent_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+        let computer_use_model_id = llm_prefs
+            .get_active_computer_use_model(ctx, Some(terminal_view_id))
+            .id
+            .clone();
+
+        let input = vec![AIAgentInput::UserQuery {
+            query: prompt,
+            context: Default::default(),
+            static_query_type: None,
+            referenced_attachments: Default::default(),
+            user_query_mode: UserQueryMode::default(),
+            running_command: None,
+            intended_agent: None,
+        }];
+
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        conversation.append_finished_text_exchange(
+            input,
+            output_text,
+            working_directory,
+            model_id,
+            coding_model_id,
+            cli_agent_model_id,
+            computer_use_model_id,
+            terminal_view_id,
+            ctx,
+        )?;
+        Ok(conversation_id)
+    }
+
     pub fn create_cli_subagent_task_for_conversation(
         &mut self,
         block_id: BlockId,
@@ -1094,6 +1356,7 @@ impl BlocklistAIHistoryModel {
             run_id: None,
             autoexecute_override: Some(source_conversation.autoexecute_override().into()),
             last_event_sequence: None,
+            acp_session_resume: None,
         };
         let forked_conversation_id = AIConversationId::new();
         if let Err(e) = sqlite_sender.send(ModelEvent::UpdateMultiAgentConversation {
@@ -1248,6 +1511,7 @@ impl BlocklistAIHistoryModel {
             run_id: None,
             autoexecute_override: Some(conversation.autoexecute_override().into()),
             last_event_sequence: None,
+            acp_session_resume: None,
         };
 
         let forked_conversation_id = AIConversationId::new();
