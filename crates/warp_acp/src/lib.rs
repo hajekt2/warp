@@ -25,9 +25,10 @@ pub use command::{
     AcpAgentCommand, AcpAgentConnection, AcpCommandError, AcpEnvironmentVariable, AcpRemoteEndpoint,
 };
 pub use jsonrpc::{AgentMessage, JsonRpcErrorObject, JsonRpcId};
+#[cfg(test)]
+pub use local_handler::AutoClientRequestUi;
 pub use local_handler::{
-    AutoClientRequestUi, ClientRequestUi, LocalClientRequestError, LocalClientRequestHandler,
-    LocalClientRequestPolicy,
+    ClientRequestUi, LocalClientRequestError, LocalClientRequestHandler, LocalClientRequestPolicy,
 };
 pub use registry::{
     codex_acp_registry_entry, known_acp_agents, opencode_registry_entry, KnownAcpAgent,

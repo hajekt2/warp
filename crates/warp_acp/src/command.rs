@@ -1,5 +1,6 @@
 use command::blocking::Command;
 use std::ffi::OsStr;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -70,11 +71,20 @@ impl AcpAgentConnection {
 }
 
 /// Environment variable configured for an ACP agent subprocess.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpEnvironmentVariable {
     pub name: String,
     pub value: String,
+}
+
+impl fmt::Debug for AcpEnvironmentVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcpEnvironmentVariable")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AcpEnvironmentVariable {
@@ -233,5 +243,15 @@ mod tests {
             err,
             AcpCommandError::InvalidEnvironmentName("BAD=NAME".to_string())
         );
+    }
+
+    #[test]
+    fn environment_variable_debug_redacts_value() {
+        let env = AcpEnvironmentVariable::new("OPENAI_API_KEY", "sk-test-token");
+
+        let debug = format!("{env:?}");
+        assert!(debug.contains("OPENAI_API_KEY"));
+        assert!(!debug.contains("sk-test-token"));
+        assert!(debug.contains("<redacted>"));
     }
 }

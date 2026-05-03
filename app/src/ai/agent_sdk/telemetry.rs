@@ -200,7 +200,7 @@ impl TelemetryEvent for CliTelemetryEvent {
     }
 
     fn contains_ugc(&self) -> bool {
-        false
+        true
     }
 
     fn event_descs() -> impl Iterator<Item = Box<dyn TelemetryEventDesc>> {
@@ -527,7 +527,7 @@ impl TelemetryEvent for AcpTelemetryEvent {
     }
 
     fn contains_ugc(&self) -> bool {
-        false
+        true
     }
 
     fn event_descs() -> impl Iterator<Item = Box<dyn TelemetryEventDesc>> {

@@ -6128,17 +6128,19 @@ enum ParsedAcpAgentInput {
 }
 
 fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
-    let parts: Vec<_> = input
-        .split('|')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
+    let parts: Vec<_> = split_acp_pipe_fields(input)?
+        .into_iter()
+        .map(|part| part.trim().to_string())
         .collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
 
     match parts.as_slice() {
         [name, argv] => {
             let (command, args, transport) = parse_acp_target(argv)?;
             Some(ParsedAcpAgentInput::Add {
-                name: (*name).to_string(),
+                name: name.clone(),
                 command,
                 transport,
                 args,
@@ -6147,8 +6149,8 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
         [id, name, argv, directives @ ..] => {
             let (command, args, transport) = parse_acp_target(argv)?;
             let mut config = AcpAgentConfig {
-                id: AcpAgentId::new(*id),
-                name: (*name).to_string(),
+                id: AcpAgentId::new(id.clone()),
+                name: name.clone(),
                 command,
                 transport,
                 args,
@@ -6162,7 +6164,7 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
 
             for directive in directives {
                 let Some((key, value)) = directive.split_once(char::is_whitespace) else {
-                    continue;
+                    return None;
                 };
                 let value = value.trim();
                 match key.trim().to_ascii_lowercase().as_str() {
@@ -6184,7 +6186,7 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
                             parse_acp_header_directive(value)?,
                         );
                     }
-                    _ => {}
+                    _ => return None,
                 }
             }
 
@@ -6197,11 +6199,41 @@ fn parse_acp_agent_input(input: &str) -> Option<ParsedAcpAgentInput> {
     }
 }
 
+fn split_acp_pipe_fields(input: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '|' => {
+                fields.push(current);
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped {
+        return None;
+    }
+    fields.push(current);
+    Some(fields)
+}
+
 fn parse_acp_target(target: &str) -> Option<(String, Vec<String>, AcpAgentTransportConfig)> {
     let argv = shell_words::split(target.trim()).ok()?;
     let (head, rest) = argv.split_first()?;
     match head.to_ascii_lowercase().as_str() {
-        "http" | "https" => {
+        "http" | "https"
+            if rest
+                .first()
+                .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://")) =>
+        {
             let url = rest.first()?.clone();
             Some((
                 String::new(),
@@ -6212,7 +6244,11 @@ fn parse_acp_target(target: &str) -> Option<(String, Vec<String>, AcpAgentTransp
                 },
             ))
         }
-        "ws" | "wss" | "websocket" => {
+        "ws" | "wss" | "websocket"
+            if rest
+                .first()
+                .is_some_and(|url| url.starts_with("ws://") || url.starts_with("wss://")) =>
+        {
             let url = rest.first()?.clone();
             Some((
                 String::new(),
@@ -6271,7 +6307,7 @@ fn parse_acp_header_directive(value: &str) -> Option<Vec<AcpAgentHttpHeader>> {
     let mut headers = Vec::new();
     for token in shell_words::split(value).ok()? {
         let (name, value) = token.split_once('=')?;
-        if name.is_empty() {
+        if name.is_empty() || value.is_empty() {
             return None;
         }
         let value = if let Some(key) = value.strip_prefix("secret:") {
@@ -6307,11 +6343,19 @@ fn set_acp_transport_headers(
 }
 
 fn parse_acp_list_directive(value: &str) -> Vec<String> {
-    value
-        .split(|ch: char| ch == ',' || ch.is_whitespace())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToString::to_string)
+    let Ok(tokens) = shell_words::split(value) else {
+        return Vec::new();
+    };
+    tokens
+        .into_iter()
+        .flat_map(|token| {
+            token
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -7673,5 +7717,59 @@ mod acp_agent_input_tests {
             }
             _ => panic!("expected websocket transport"),
         }
+    }
+
+    #[test]
+    fn parses_escaped_pipe_mcp_argv_entries() {
+        let Some(ParsedAcpAgentInput::Upsert(config)) = parse_acp_agent_input(
+            r#"agent | Agent | opencode acp --port 0 | mcp local\|/bin/echo\|hello"#,
+        ) else {
+            panic!("expected ACP config");
+        };
+
+        assert_eq!(config.mcp_allowlist, vec!["local|/bin/echo|hello"]);
+    }
+
+    #[test]
+    fn rejects_empty_pipe_fields_and_unknown_directives() {
+        assert!(parse_acp_agent_input("agent || opencode").is_none());
+        assert!(parse_acp_agent_input("agent | Agent | opencode | surprise value").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_headers_but_preserves_env_equals_values() {
+        assert!(parse_acp_agent_input(
+            "agent | Agent | http https://example.test | header Authorization="
+        )
+        .is_none());
+
+        let Some(ParsedAcpAgentInput::Upsert(config)) =
+            parse_acp_agent_input(r#"agent | Agent | opencode | env TOKEN=a=b=c"#)
+        else {
+            panic!("expected ACP config");
+        };
+        assert_eq!(
+            config.env[0].value,
+            AcpAgentEnvValue::Literal {
+                value: "a=b=c".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn treats_http_command_without_url_as_local_argv() {
+        let Some(ParsedAcpAgentInput::Add {
+            command,
+            args,
+            transport,
+            ..
+        }) = parse_acp_agent_input("Local HTTP | http --stdio")
+        else {
+            panic!("expected local ACP config");
+        };
+
+        assert_eq!(command, "http");
+        assert_eq!(args, vec!["--stdio"]);
+        assert!(matches!(transport, AcpAgentTransportConfig::Local));
     }
 }

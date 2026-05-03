@@ -757,7 +757,6 @@ impl std::fmt::Display for AcpAgentId {
 
 /// Environment values for a configured ACP agent.
 #[derive(
-    Debug,
     Clone,
     PartialEq,
     Eq,
@@ -773,6 +772,22 @@ pub enum AcpAgentEnvValue {
     Literal { value: String },
     /// Reference to a secret managed outside synced settings.
     SecretRef { key: String },
+}
+
+impl fmt::Debug for AcpAgentEnvValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal { .. } => f
+                .debug_struct("Literal")
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::SecretRef { key } => f
+                .debug_struct("SecretRef")
+                .field("key", key)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// One environment variable requested by a configured ACP agent.
@@ -819,6 +834,8 @@ impl fmt::Debug for AcpAgentHttpHeader {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AcpAgentConnectionError {
+    #[error("Local ACP agent `{agent}` must be confirmed on this device before launch")]
+    LocalConfirmationRequired { agent: String },
     #[error("ACP agent secret header `{key}` is missing; configure missing secret: {key}")]
     MissingSecret { key: String },
     #[error(transparent)]
@@ -923,6 +940,15 @@ pub struct AcpAgentConfig {
 impl AcpAgentConfig {
     pub fn is_local_transport(&self) -> bool {
         matches!(self.transport, AcpAgentTransportConfig::Local)
+    }
+
+    pub fn ensure_local_launch_confirmed(&self) -> Result<(), AcpAgentConnectionError> {
+        if self.is_local_transport() && !self.local_confirmation.confirmed_on_this_device {
+            return Err(AcpAgentConnectionError::LocalConfirmationRequired {
+                agent: self.name.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn to_launch_command(&self) -> anyhow::Result<warp_acp::AcpAgentCommand> {
@@ -1892,7 +1918,8 @@ impl AISettings {
         };
 
         let mut configs = self.acp_agent_configs.value().clone();
-        let new_config = AcpAgentConfig::from_registry_entry(entry);
+        let mut new_config = AcpAgentConfig::from_registry_entry(entry);
+        new_config.local_confirmation.confirmed_on_this_device = true;
         if configs.iter().any(|config| config.id == new_config.id) {
             return;
         }

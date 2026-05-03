@@ -1,5 +1,7 @@
-use super::validate_cli_installed;
+use super::{harness_kind, validate_cli_installed, HarnessKind};
 use crate::ai::agent_sdk::driver::AgentDriverError;
+use warp_cli::agent::Harness;
+use warp_core::features::FeatureFlag;
 
 fn assert_harness_setup_failed(err: &AgentDriverError) -> (&str, &str) {
     match err {
@@ -30,4 +32,15 @@ fn validate_cli_installed_includes_docs_url_in_error() {
     let (_, reason) = assert_harness_setup_failed(&err);
     assert!(reason.contains(url));
     assert!(reason.contains("Install it first"));
+}
+
+#[test]
+fn opencode_legacy_harness_targets_opencode_acp_agent() {
+    let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+
+    let HarnessKind::Acp(harness) = harness_kind(Harness::OpenCode).unwrap() else {
+        panic!("expected OpenCode legacy harness to route through ACP");
+    };
+
+    assert_eq!(harness.agent_id().unwrap().as_str(), "opencode");
 }

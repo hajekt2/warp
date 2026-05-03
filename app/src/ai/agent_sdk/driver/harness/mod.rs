@@ -236,9 +236,9 @@ pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverE
         // Keep the legacy CLI slug as an alias so persisted runs and scripts
         // that still pass `--harness opencode` route to the ACP path instead
         // of failing with an unsupported-harness error.
-        Harness::OpenCode if FeatureFlag::AcpClient.is_enabled() => {
-            Ok(HarnessKind::Acp(AcpHarness::new()))
-        }
+        Harness::OpenCode if FeatureFlag::AcpClient.is_enabled() => Ok(HarnessKind::Acp(
+            AcpHarness::with_agent_id(crate::settings::ai::AcpAgentId::new("opencode")),
+        )),
         Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
         Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
         Harness::Acp if FeatureFlag::AcpClient.is_enabled() => {

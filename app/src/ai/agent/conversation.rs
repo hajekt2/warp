@@ -2754,7 +2754,26 @@ impl AIConversation {
         else {
             return Err(UpdateConversationError::OutputAlreadyFinished);
         };
-        *streaming_output.get_mut() = output;
+        let mut streaming_output = streaming_output.get_mut();
+        for message in output.messages {
+            if let Some(existing) = streaming_output
+                .messages
+                .iter_mut()
+                .find(|existing| existing.id == message.id)
+            {
+                *existing = message;
+            } else {
+                streaming_output.messages.push(message);
+            }
+        }
+        streaming_output.citations = output.citations;
+        streaming_output.server_output_id = output.server_output_id;
+        streaming_output.api_metadata_bytes = output.api_metadata_bytes;
+        streaming_output.suggestions = output.suggestions;
+        streaming_output.model_info = output.model_info;
+        streaming_output.telemetry_events = output.telemetry_events;
+        streaming_output.request_cost = output.request_cost;
+        drop(streaming_output);
 
         let conversation_id = self.id;
         let is_hidden = self.is_exchange_hidden(exchange_id);

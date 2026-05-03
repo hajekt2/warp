@@ -331,6 +331,7 @@ impl JsonRpcStdioTransport {
     pub fn kill_child(&self) -> Result<(), std::io::Error> {
         if let Some(child) = self.child.lock().expect("child poisoned").as_mut() {
             child.kill()?;
+            let _ = child.wait();
         }
         Ok(())
     }
@@ -438,9 +439,8 @@ impl JsonRpcHttpTransport {
 
     pub fn recv_message(
         &self,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<Option<AgentMessage>, JsonRpcTransportError> {
-        std::thread::sleep(timeout);
         Ok(None)
     }
 
@@ -992,6 +992,7 @@ impl Drop for JsonRpcStdioTransport {
             if let Some(child) = child.as_mut() {
                 if matches!(child.try_wait(), Ok(None)) {
                     let _ = child.kill();
+                    let _ = child.wait();
                 }
             }
         }
@@ -1058,6 +1059,18 @@ mod tests {
             .unwrap();
         assert_eq!(result, json!({"ok": true}));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_recv_message_returns_immediately() {
+        let endpoint = AcpRemoteEndpoint::new("http://127.0.0.1:9/acp");
+        let transport = JsonRpcHttpTransport::connect(&endpoint).unwrap();
+        let started_at = Instant::now();
+
+        let message = transport.recv_message(Duration::from_secs(30)).unwrap();
+
+        assert!(message.is_none());
+        assert!(started_at.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

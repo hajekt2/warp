@@ -12,9 +12,9 @@ use thiserror::Error;
 
 use crate::schema::{
     KillTerminalResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    TerminalExitStatus, TerminalOutputResponse, TerminalRefRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, TerminalExitStatus,
+    TerminalOutputResponse, TerminalRefRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use crate::{AgentMessage, JsonRpcErrorObject, JsonRpcTransportError, JsonRpcTransportHandle};
 
@@ -95,6 +95,54 @@ pub trait ClientRequestUi: Send + Sync {
         _request: &ReadTextFileRequest,
         _resolved_path: &Path,
     ) -> Result<bool, LocalClientRequestError> {
+        Ok(false)
+    }
+
+    fn approve_write_text_file(
+        &self,
+        _request: &WriteTextFileRequest,
+        _resolved_path: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(false)
+    }
+
+    fn request_permission(
+        &self,
+        request: &RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, LocalClientRequestError>;
+
+    fn approve_terminal(
+        &self,
+        _request: &crate::schema::CreateTerminalRequest,
+        _resolved_cwd: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(false)
+    }
+}
+
+#[derive(Default)]
+struct DenyClientRequestUi;
+
+impl ClientRequestUi for DenyClientRequestUi {
+    fn request_permission(
+        &self,
+        _request: &RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, LocalClientRequestError> {
+        Ok(RequestPermissionResponse::cancelled())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct AutoClientRequestUi;
+
+#[cfg(test)]
+impl ClientRequestUi for AutoClientRequestUi {
+    fn approve_read_text_file(
+        &self,
+        _request: &ReadTextFileRequest,
+        _resolved_path: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
         Ok(true)
     }
 
@@ -109,24 +157,6 @@ pub trait ClientRequestUi: Send + Sync {
     fn request_permission(
         &self,
         request: &RequestPermissionRequest,
-    ) -> Result<RequestPermissionResponse, LocalClientRequestError>;
-
-    fn approve_terminal(
-        &self,
-        _request: &crate::schema::CreateTerminalRequest,
-        _resolved_cwd: &Path,
-    ) -> Result<bool, LocalClientRequestError> {
-        Ok(true)
-    }
-}
-
-#[derive(Default)]
-pub struct AutoClientRequestUi;
-
-impl ClientRequestUi for AutoClientRequestUi {
-    fn request_permission(
-        &self,
-        request: &RequestPermissionRequest,
     ) -> Result<RequestPermissionResponse, LocalClientRequestError> {
         let selected = request
             .options
@@ -138,12 +168,20 @@ impl ClientRequestUi for AutoClientRequestUi {
             .or_else(|| request.options.first());
         Ok(match selected {
             Some(option) => RequestPermissionResponse {
-                outcome: RequestPermissionOutcome::Selected {
+                outcome: crate::schema::RequestPermissionOutcome::Selected {
                     option_id: option.option_id.clone(),
                 },
             },
             None => RequestPermissionResponse::cancelled(),
         })
+    }
+
+    fn approve_terminal(
+        &self,
+        _request: &crate::schema::CreateTerminalRequest,
+        _resolved_cwd: &Path,
+    ) -> Result<bool, LocalClientRequestError> {
+        Ok(true)
     }
 }
 
@@ -155,7 +193,7 @@ impl LocalClientRequestHandler {
             workspace_root,
             terminals: HashMap::new(),
             next_terminal_id: 1,
-            ui: Arc::new(AutoClientRequestUi),
+            ui: Arc::new(DenyClientRequestUi),
         })
     }
 
@@ -566,7 +604,8 @@ mod tests {
             allow_terminal: false,
             allow_permission_selection: false,
         })
-        .unwrap();
+        .unwrap()
+        .with_ui(Arc::new(AutoClientRequestUi));
         let writer = SharedWriter::default();
         let captured = Arc::clone(&writer.0);
         let transport =
@@ -599,7 +638,8 @@ mod tests {
             allow_terminal: false,
             allow_permission_selection: false,
         })
-        .unwrap();
+        .unwrap()
+        .with_ui(Arc::new(AutoClientRequestUi));
         let writer = SharedWriter::default();
         let captured = Arc::clone(&writer.0);
         let transport =
@@ -631,7 +671,8 @@ mod tests {
             allow_terminal: false,
             allow_permission_selection: false,
         })
-        .unwrap();
+        .unwrap()
+        .with_ui(Arc::new(AutoClientRequestUi));
         let transport = JsonRpcStdioTransport::from_reader_writer(
             Cursor::new(Vec::new()),
             SharedWriter::default(),
@@ -742,6 +783,40 @@ mod tests {
     }
 
     #[test]
+    fn default_ui_denies_enabled_capabilities_without_explicit_ui() {
+        let dir = temp_dir();
+        fs::write(dir.join("readable.txt"), "secret").unwrap();
+        let mut handler = LocalClientRequestHandler::new(LocalClientRequestPolicy {
+            workspace_root: dir.clone(),
+            allow_read_text_file: true,
+            allow_write_text_file: false,
+            allow_terminal: false,
+            allow_permission_selection: false,
+        })
+        .unwrap();
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let transport =
+            JsonRpcStdioTransport::from_reader_writer(Cursor::new(Vec::new()), writer, None);
+
+        handler
+            .handle(
+                AgentMessage::Request {
+                    id: JsonRpcId::Number(12),
+                    method: "fs/read_text_file".to_string(),
+                    params: json!({"sessionId":"s","path":"readable.txt"}),
+                },
+                &transport,
+            )
+            .unwrap();
+
+        let written = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(written.contains(r#""code":-32002"#));
+        assert!(!written.contains("secret"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn write_request_waits_for_ui_decision() {
         let dir = temp_dir();
         let ui = Arc::new(RecordingUi {
@@ -794,7 +869,8 @@ mod tests {
             allow_terminal: true,
             allow_permission_selection: false,
         })
-        .unwrap();
+        .unwrap()
+        .with_ui(Arc::new(AutoClientRequestUi));
 
         let terminal_id = handler
             .create_terminal(json!({

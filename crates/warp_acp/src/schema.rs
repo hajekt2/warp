@@ -841,11 +841,20 @@ pub struct CreateTerminalRequest {
     pub output_byte_limit: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpEnvironmentEntry {
     pub name: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for AcpEnvironmentEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpEnvironmentEntry")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,5 +1116,23 @@ mod tests {
                 text: "hello".to_string()
             })
         );
+    }
+
+    #[test]
+    fn mcp_stdio_env_debug_redacts_values() {
+        let server = McpServerStdio {
+            name: "local".to_string(),
+            command: "/bin/echo".into(),
+            args: Vec::new(),
+            env: vec![AcpEnvironmentEntry {
+                name: "TOKEN".to_string(),
+                value: "secret-token".to_string(),
+            }],
+        };
+
+        let debug = format!("{server:?}");
+        assert!(debug.contains("TOKEN"));
+        assert!(!debug.contains("secret-token"));
+        assert!(debug.contains("<redacted>"));
     }
 }

@@ -826,6 +826,7 @@ impl AgentDriverRunner {
                     cloud_providers: Vec::new(),
                     environment: None,
                     selected_harness: args.harness,
+                    login_optional_local_acp_run: is_login_optional_local_acp_run,
                     snapshot_disabled: args.snapshot.no_snapshot.then_some(true),
                     snapshot_upload_timeout: args
                         .snapshot

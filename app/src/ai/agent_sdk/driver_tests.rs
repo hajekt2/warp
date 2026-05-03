@@ -227,6 +227,37 @@ fn acp_streaming_output_builder_maps_structured_updates_to_warp_messages() {
         .any(|text| agent_text_contains(text, "Ship it")));
 }
 
+#[test]
+fn acp_streaming_output_builder_replaces_replayed_tool_call_updates() {
+    let mut builder = AcpStreamingOutputBuilder::default();
+
+    assert!(builder.apply_update(SessionUpdate::ToolCallUpdate {
+        id: "tool-1".to_string(),
+        status: Some("running".to_string()),
+        args: None,
+        output: Some("first output".to_string()),
+    }));
+    assert!(builder.apply_update(SessionUpdate::ToolCallUpdate {
+        id: "tool-1".to_string(),
+        status: Some("completed".to_string()),
+        args: None,
+        output: Some("second output".to_string()),
+    }));
+
+    let output = builder.output();
+    let update_messages = output
+        .messages
+        .iter()
+        .filter(|message| message.id == MessageId::new("acp-tool-update-tool-1".to_string()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(update_messages.len(), 1);
+    let update_text = update_messages[0].to_string();
+    assert!(update_text.contains("completed"));
+    assert!(update_text.contains("second output"));
+    assert!(!update_text.contains("first output"));
+}
+
 fn agent_text_contains(text: &crate::ai::agent::AIAgentText, needle: &str) -> bool {
     text.sections.iter().any(|section| match section {
         crate::ai::agent::AIAgentTextSection::PlainText { text } => text.text().contains(needle),

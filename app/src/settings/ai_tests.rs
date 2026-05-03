@@ -539,6 +539,38 @@ fn acp_agent_http_header_debug_redacts_secret_values() {
 }
 
 #[test]
+fn acp_agent_env_value_debug_redacts_literal_values() {
+    let value = AcpAgentEnvValue::Literal {
+        value: "sk-test-token".to_string(),
+    };
+
+    let debug = format!("{value:?}");
+    assert!(!debug.contains("sk-test-token"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn local_acp_agent_requires_device_confirmation_before_launch() {
+    let config = AcpAgentConfig {
+        id: AcpAgentId::new("local"),
+        name: "Local".to_string(),
+        command: "opencode".to_string(),
+        transport: AcpAgentTransportConfig::Local,
+        args: vec!["acp".to_string()],
+        env: Vec::new(),
+        mcp_allowlist: Vec::new(),
+        install_url: None,
+        registry_key: None,
+        local_confirmation: AcpAgentLocalConfirmation::default(),
+    };
+
+    assert!(matches!(
+        config.ensure_local_launch_confirmed(),
+        Err(AcpAgentConnectionError::LocalConfirmationRequired { .. })
+    ));
+}
+
+#[test]
 fn test_configured_acp_agents_are_feature_gated() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);

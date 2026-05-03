@@ -347,9 +347,12 @@ impl LocalAcpPromptRequest {
 
     pub(super) async fn run(self) -> anyhow::Result<LocalAcpPromptResult> {
         log::info!(
-            "Starting local ACP agent '{}' with argv {:?}",
+            "Starting local ACP agent '{}' with command '{}' ({} arg(s))",
             self.agent_id.as_str(),
             self.command_argv
+                .first()
+                .map_or("<missing>", String::as_str),
+            self.command_argv.len().saturating_sub(1)
         );
 
         let stream_handle = self.start_history_exchange().await?;

@@ -7,12 +7,14 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use super::telemetry::AcpTelemetryEvent;
 
 use crate::ai::blocklist::task_status_sync_model::TaskStatusSyncModel;
 use crate::ai::document::ai_document_model::{AIDocumentModel, AIDocumentModelEvent};
@@ -63,6 +65,7 @@ use crate::{
     },
     auth::AuthStateProvider,
     cloud_object::CloudObject,
+    send_telemetry_from_ctx,
     server::{
         ids::{ServerId, SyncId},
         server_api::{
@@ -88,9 +91,10 @@ use serde_json::Value;
 use uuid::Uuid;
 use warp_acp::{
     AcpClient, AcpEnvironmentEntry, AcpHttpHeader, AgentMessage, AuthenticateRequest,
-    ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation, InitializeRequest,
-    LocalClientRequestHandler, LocalClientRequestPolicy, McpServer, McpServerSse, McpServerStdio,
-    NewSessionRequest, SessionUpdate,
+    ClientCapabilities, ClientRequestUi, ContentBlock, FileSystemCapabilities, Implementation,
+    InitializeRequest, LocalClientRequestError, LocalClientRequestHandler,
+    LocalClientRequestPolicy, McpServer, McpServerSse, McpServerStdio, NewSessionRequest,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId as AcpSessionId, SessionUpdate,
 };
 use warp_cli::agent::{Harness, OutputFormat};
 use warp_cli::mcp::MCPSpec;
@@ -246,6 +250,8 @@ pub struct AgentDriverOptions {
     pub environment: Option<AmbientAgentEnvironment>,
     /// Selected execution harness for this run.
     pub selected_harness: Harness,
+    /// Whether this ACP/OpenCode run has been proven fully local and can skip Warp auth.
+    pub login_optional_local_acp_run: bool,
     /// Whether to skip end-of-run snapshot upload.
     pub snapshot_disabled: Option<bool>,
     /// End-of-run snapshot upload timeout override.
@@ -325,6 +331,43 @@ pub(crate) struct AcpStreamingOutputBuilder {
     reasoning_text: String,
     reasoning_message_id: Option<MessageId>,
     tool_call_message_ids: HashMap<String, MessageId>,
+}
+
+type AcpCancellationState = Arc<Mutex<Option<(Arc<AcpClient>, AcpSessionId)>>>;
+
+struct AcpRunCancellationGuard {
+    state: AcpCancellationState,
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for AcpRunCancellationGuard {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((client, session_id)) = self
+            .state
+            .lock()
+            .expect("ACP cancellation state poisoned")
+            .clone()
+        else {
+            return;
+        };
+        if let Err(error) = client.cancel(session_id) {
+            log::warn!("Failed to cancel ACP session after driver drop: {error}");
+        }
+    }
+}
+
+struct DriverAcpClientRequestUi;
+
+impl ClientRequestUi for DriverAcpClientRequestUi {
+    fn request_permission(
+        &self,
+        _request: &RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, LocalClientRequestError> {
+        Ok(RequestPermissionResponse::cancelled())
+    }
 }
 
 impl AcpStreamingOutputBuilder {
@@ -446,8 +489,8 @@ impl AcpStreamingOutputBuilder {
             lines.push(format!("Output:\n```\n{output}\n```"));
         }
         if !lines.is_empty() {
-            self.messages.push(AIAgentOutputMessage::debug_output(
-                MessageId::new(format!("acp-tool-update-{id}-{}", self.messages.len())),
+            self.upsert_message(AIAgentOutputMessage::debug_output(
+                MessageId::new(format!("acp-tool-update-{id}")),
                 format!("ACP tool `{id}` update\n{}", lines.join("\n\n")),
             ));
         }
@@ -662,6 +705,7 @@ impl AgentDriver {
             cloud_providers,
             environment,
             selected_harness,
+            login_optional_local_acp_run,
             snapshot_disabled,
             snapshot_upload_timeout,
             snapshot_script_timeout,
@@ -687,9 +731,7 @@ impl AgentDriver {
         // Local ACP agents are user-provided subprocesses and can run without a Warp account.
         // Server-backed harnesses still require auth because their setup uses Warp APIs and
         // account-scoped state.
-        if !matches!(selected_harness, Harness::Acp | Harness::OpenCode)
-            && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
-        {
+        if !login_optional_local_acp_run && !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return Err(AgentDriverError::NotLoggedIn);
         }
 
@@ -1676,54 +1718,76 @@ impl AgentDriver {
         foreground: &ModelSpawner<Self>,
     ) -> Result<(), AgentDriverError> {
         let selected_agent_id = harness.agent_id().cloned();
-        let (terminal_view_id, working_dir, config, server_api, request_policy, mcp_servers) =
-            foreground
-                .spawn(move |me, ctx| {
-                    let settings = AISettings::as_ref(ctx);
-                    let config = match selected_agent_id.as_ref() {
-                        Some(id) => settings.acp_agent_config(id).cloned().ok_or_else(|| {
-                            AgentDriverError::HarnessSetupFailed {
-                                harness: Harness::Acp.to_string(),
-                                reason: format!("Configured ACP agent '{id}' was not found."),
-                            }
+        let (
+            terminal_view_id,
+            working_dir,
+            agent_id,
+            connection,
+            server_api,
+            request_policy,
+            mcp_servers,
+        ) = foreground
+            .spawn(move |me, ctx| {
+                let settings = AISettings::as_ref(ctx);
+                let config = match selected_agent_id.as_ref() {
+                    Some(id) => settings.acp_agent_config(id).cloned().ok_or_else(|| {
+                        AgentDriverError::HarnessSetupFailed {
+                            harness: Harness::Acp.to_string(),
+                            reason: format!("Configured ACP agent '{id}' was not found."),
+                        }
+                    })?,
+                    None => settings
+                        .configured_acp_agents()
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| AgentDriverError::HarnessSetupFailed {
+                            harness: Harness::Acp.to_string(),
+                            reason: "No ACP agents are configured in AI settings.".to_string(),
                         })?,
-                        None => settings
-                            .configured_acp_agents()
-                            .first()
-                            .cloned()
-                            .ok_or_else(|| AgentDriverError::HarnessSetupFailed {
-                                harness: Harness::Acp.to_string(),
-                                reason: "No ACP agents are configured in AI settings.".to_string(),
-                            })?,
-                    };
-                    let terminal_view_id = me.terminal_driver.as_ref(ctx).terminal_view().id();
-                    let permissions = BlocklistAIPermissions::as_ref(ctx);
-                    let read_files_setting =
-                        permissions.get_read_files_setting(ctx, Some(terminal_view_id));
-                    let apply_diffs_setting =
-                        permissions.get_apply_code_diffs_setting(ctx, Some(terminal_view_id));
-                    let execute_commands_setting =
-                        permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
-                    let request_policy = LocalClientRequestPolicy {
-                        workspace_root: me.working_dir.clone(),
-                        allow_read_text_file: !read_files_setting.is_always_ask(),
-                        allow_write_text_file: apply_diffs_setting.is_always_allow(),
-                        allow_terminal: execute_commands_setting.is_always_allow(),
-                        allow_permission_selection: apply_diffs_setting.is_always_allow()
-                            || execute_commands_setting.is_always_allow(),
-                    };
-                    let mcp_servers =
-                        Self::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
-                    Ok::<_, AgentDriverError>((
-                        terminal_view_id,
-                        me.working_dir.clone(),
-                        config,
-                        ServerApiProvider::as_ref(ctx).get_harness_support_client(),
-                        request_policy,
-                        mcp_servers,
-                    ))
-                })
-                .await??;
+                };
+                if config.is_local_transport() {
+                    config.ensure_local_launch_confirmed().map_err(|error| {
+                        AgentDriverError::HarnessSetupFailed {
+                            harness: Harness::Acp.to_string(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    harness::validate_cli_installed(
+                        &config.command,
+                        config.install_url.as_deref(),
+                    )?;
+                }
+                let connection = config
+                    .to_agent_connection(ctx)
+                    .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
+                let terminal_view_id = me.terminal_driver.as_ref(ctx).terminal_view().id();
+                let permissions = BlocklistAIPermissions::as_ref(ctx);
+                let read_files_setting =
+                    permissions.get_read_files_setting(ctx, Some(terminal_view_id));
+                let apply_diffs_setting =
+                    permissions.get_apply_code_diffs_setting(ctx, Some(terminal_view_id));
+                let execute_commands_setting =
+                    permissions.get_execute_commands_setting(ctx, Some(terminal_view_id));
+                let request_policy = LocalClientRequestPolicy {
+                    workspace_root: me.working_dir.clone(),
+                    allow_read_text_file: !read_files_setting.is_always_ask(),
+                    allow_write_text_file: apply_diffs_setting.is_always_allow(),
+                    allow_terminal: execute_commands_setting.is_always_allow(),
+                    allow_permission_selection: apply_diffs_setting.is_always_allow()
+                        || execute_commands_setting.is_always_allow(),
+                };
+                let mcp_servers = Self::acp_mcp_servers_from_allowlist(&config.mcp_allowlist, ctx);
+                Ok::<_, AgentDriverError>((
+                    terminal_view_id,
+                    me.working_dir.clone(),
+                    config.id.clone(),
+                    connection,
+                    ServerApiProvider::as_ref(ctx).get_harness_support_client(),
+                    request_policy,
+                    mcp_servers,
+                ))
+            })
+            .await??;
 
         let prompt_text: Cow<'_, str> = match prompt {
             AgentRunPrompt::Local(text) => Cow::Owned(text),
@@ -1747,13 +1811,11 @@ impl AgentDriver {
             }
         };
 
-        harness::validate_cli_installed(&config.command, config.install_url.as_deref())?;
-        let command = config
-            .to_launch_command()
-            .map_err(AgentDriverError::ConfigBuildFailed)?;
         let prompt = prompt_text.into_owned();
         let prompt_for_history = prompt.clone();
         let working_dir_for_history = working_dir.clone();
+        let prompt_started_at = Instant::now();
+        let agent_id_for_telemetry = agent_id.as_str().to_string();
         let stream_handle = foreground
             .spawn(move |_, ctx| {
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
@@ -1769,8 +1831,18 @@ impl AgentDriver {
             .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
 
         let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<AIAgentOutput>();
+        let (telemetry_tx, mut telemetry_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AcpTelemetryEvent>();
+        let cancellation_state: AcpCancellationState = Arc::new(Mutex::new(None));
+        let acp_run_completed = Arc::new(AtomicBool::new(false));
+        let _cancellation_guard = AcpRunCancellationGuard {
+            state: Arc::clone(&cancellation_state),
+            completed: Arc::clone(&acp_run_completed),
+        };
+        let agent_id_for_blocking = agent_id_for_telemetry.clone();
         let acp_run = tokio::task::spawn_blocking(move || {
-            let client = AcpClient::spawn(&command).map_err(anyhow::Error::from)?;
+            let agent_id_for_telemetry = agent_id_for_blocking;
+            let client = Arc::new(AcpClient::connect(&connection).map_err(anyhow::Error::from)?);
             let fs_capabilities = match (
                 request_policy.allow_read_text_file,
                 request_policy.allow_write_text_file,
@@ -1779,6 +1851,7 @@ impl AgentDriver {
                 (true, false) => FileSystemCapabilities::read_only(),
                 _ => FileSystemCapabilities::none(),
             };
+            let initialize_started_at = Instant::now();
             let initialize_response = client
                 .initialize_with(InitializeRequest::new(
                     Some(Implementation::new("Warp").with_version(env!("CARGO_PKG_VERSION"))),
@@ -1787,6 +1860,20 @@ impl AgentDriver {
                         .with_terminal(request_policy.allow_terminal),
                 ))
                 .map_err(anyhow::Error::from)?;
+            let _ = telemetry_tx.send(AcpTelemetryEvent::InitializeCompleted {
+                agent_id: agent_id_for_telemetry.clone(),
+                agent_name: initialize_response
+                    .agent_info
+                    .as_ref()
+                    .map(|agent| agent.name.clone()),
+                agent_version: initialize_response
+                    .agent_info
+                    .as_ref()
+                    .and_then(|agent| agent.version.clone()),
+                latency_ms: initialize_started_at.elapsed().as_millis(),
+                success: true,
+                error_kind: None,
+            });
             if let Some(method_id) =
                 Self::preferred_acp_auth_method(&initialize_response.auth_methods)
             {
@@ -1800,14 +1887,26 @@ impl AgentDriver {
                 mcp_servers,
                 &initialize_response.agent_capabilities,
             );
+            let mcp_server_count = mcp_servers.len();
             let session = client
                 .new_session(NewSessionRequest::new(working_dir).with_mcp_servers(mcp_servers))
                 .map_err(anyhow::Error::from)?;
             let session_id = session.session_id.clone();
-            let mut request_handler =
-                LocalClientRequestHandler::new(request_policy).map_err(|error| anyhow!(error))?;
+            let _ = telemetry_tx.send(AcpTelemetryEvent::SessionStarted {
+                agent_id: agent_id_for_telemetry.clone(),
+                mcp_server_count,
+            });
+            *cancellation_state
+                .lock()
+                .expect("ACP cancellation state poisoned") =
+                Some((Arc::clone(&client), session_id.clone()));
+            let mut request_handler = LocalClientRequestHandler::new(request_policy)
+                .map_err(|error| anyhow!(error))?
+                .with_ui(Arc::new(DriverAcpClientRequestUi));
             let output = Arc::new(Mutex::new(AcpStreamingOutputBuilder::default()));
             let output_for_notifications = Arc::clone(&output);
+            let telemetry_for_requests = telemetry_tx.clone();
+            let agent_id_for_requests = agent_id_for_telemetry.clone();
             client
                 .prompt_with_agent_message_and_request_handler(
                     session.session_id,
@@ -1822,21 +1921,34 @@ impl AgentDriver {
                             }
                         }
                     },
-                    move |message, transport| request_handler.handle(message, transport),
+                    move |message, transport| {
+                        let method = match &message {
+                            AgentMessage::Request { method, .. } => method.clone(),
+                            AgentMessage::Notification { method, .. } => method.clone(),
+                        };
+                        let result = request_handler.handle(message, transport);
+                        let _ = telemetry_for_requests.send(AcpTelemetryEvent::ClientRequest {
+                            agent_id: agent_id_for_requests.clone(),
+                            method,
+                            outcome: if result.is_ok() { "ok" } else { "error" }.to_string(),
+                        });
+                        result
+                    },
                 )
                 .map_err(anyhow::Error::from)?;
             let _ = client.close_session(session_id);
+            acp_run_completed.store(true, Ordering::Relaxed);
             let output = output.lock().expect("ACP output builder poisoned").output();
             Ok::<_, anyhow::Error>(output)
         });
 
         tokio::pin!(acp_run);
-        let output_text = loop {
+        let output_result: Result<AIAgentOutput, AgentDriverError> = loop {
             tokio::select! {
                 maybe_output = output_rx.recv() => {
                     if let Some(output) = maybe_output {
                         let handle = stream_handle.clone();
-                        foreground
+                        let update_result = foreground
                             .spawn(move |_, ctx| {
                                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
                                     history.update_streaming_exchange_output(
@@ -1847,21 +1959,40 @@ impl AgentDriver {
                                     )
                                 })
                             })
-                            .await?
-                            .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
+                            .await;
+                        match update_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                break Err(AgentDriverError::ConfigBuildFailed(anyhow!(error)));
+                            }
+                            Err(error) => break Err(error.into()),
+                        }
+                    }
+                }
+                maybe_event = telemetry_rx.recv() => {
+                    if let Some(event) = maybe_event {
+                        if let Err(error) = foreground
+                            .spawn(move |_, ctx| {
+                                send_telemetry_from_ctx!(event, ctx);
+                            })
+                            .await
+                        {
+                            log::warn!("Failed to emit ACP telemetry event: {error}");
+                        }
                     }
                 }
                 result = &mut acp_run => {
                     break result
-                        .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?
-                        .map_err(AgentDriverError::ConfigBuildFailed)?;
+                        .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))
+                        .and_then(|result| result.map_err(AgentDriverError::ConfigBuildFailed));
                 }
             }
         };
 
+        let mut output_result = output_result;
         while let Ok(output) = output_rx.try_recv() {
             let handle = stream_handle.clone();
-            foreground
+            let update_result = foreground
                 .spawn(move |_, ctx| {
                     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
                         history.update_streaming_exchange_output(
@@ -1872,16 +2003,76 @@ impl AgentDriver {
                         )
                     })
                 })
-                .await?
-                .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
+                .await;
+            match update_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if output_result.is_ok() {
+                        output_result = Err(AgentDriverError::ConfigBuildFailed(anyhow!(error)));
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if output_result.is_ok() {
+                        output_result = Err(error.into());
+                    }
+                    break;
+                }
+            }
+        }
+        while let Ok(event) = telemetry_rx.try_recv() {
+            if let Err(error) = foreground
+                .spawn(move |_, ctx| {
+                    send_telemetry_from_ctx!(event, ctx);
+                })
+                .await
+            {
+                log::warn!("Failed to emit ACP telemetry event: {error}");
+            }
         }
 
-        let final_output = if output_text.messages.is_empty() {
-            AcpStreamingOutputBuilder::error_output(
-                "ACP agent completed without streamed text output.",
-            )
-        } else {
-            output_text
+        let telemetry_agent_id = agent_id_for_telemetry.clone();
+        let telemetry_error = output_result.as_ref().err().map(ToString::to_string);
+        foreground
+            .spawn(move |_, ctx| {
+                send_telemetry_from_ctx!(
+                    AcpTelemetryEvent::PromptCompleted {
+                        agent_id: telemetry_agent_id.clone(),
+                        latency_ms: prompt_started_at.elapsed().as_millis(),
+                        stop_reason: if telemetry_error.is_some() {
+                            "error".to_string()
+                        } else {
+                            "completed".to_string()
+                        },
+                        tool_call_count: 0,
+                        agent_message_chunk_count: 0,
+                        error_kind: telemetry_error.clone(),
+                    },
+                    ctx
+                );
+                if let Some(kind) = telemetry_error {
+                    send_telemetry_from_ctx!(
+                        AcpTelemetryEvent::TransportError {
+                            agent_id: telemetry_agent_id,
+                            kind,
+                        },
+                        ctx
+                    );
+                }
+            })
+            .await
+            .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
+
+        let final_output = match &output_result {
+            Ok(output_text) if output_text.messages.is_empty() => {
+                AcpStreamingOutputBuilder::error_output(
+                    "ACP agent completed without streamed text output.",
+                )
+            }
+            Ok(output_text) => output_text.clone(),
+            Err(error) => AcpStreamingOutputBuilder::error_output(format!(
+                "ACP agent failed before completing the prompt: {error}"
+            )),
         };
         foreground
             .spawn(move |_, ctx| {
@@ -1901,7 +2092,7 @@ impl AgentDriver {
             })
             .await?
             .map_err(|error| AgentDriverError::ConfigBuildFailed(anyhow!(error)))?;
-        Ok(())
+        output_result.map(|_| ())
     }
 
     pub(crate) fn acp_mcp_servers_from_allowlist(

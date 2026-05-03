@@ -638,6 +638,10 @@ impl AmbientAgentViewModel {
         };
 
         if config.is_local_transport() {
+            if let Err(error) = config.ensure_local_launch_confirmed() {
+                self.handle_spawn_error(error.to_string(), ctx);
+                return;
+            }
             if let Err(error) =
                 validate_cli_installed(&config.command, config.install_url.as_deref())
             {
