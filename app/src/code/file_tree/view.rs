@@ -2562,14 +2562,6 @@ impl FileTreeView {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn displayed_root_paths_for_test(&self) -> Vec<PathBuf> {
-        self.displayed_directories
-            .iter()
-            .map(|path| path.to_local_path_lossy())
-            .collect()
-    }
-
     /// Get total count of items across all roots
     fn total_item_count(&self) -> usize {
         self.displayed_root_directories()
