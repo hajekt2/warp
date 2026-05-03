@@ -609,6 +609,7 @@ fn test_configured_acp_agents_are_feature_gated() {
 fn test_configured_acp_agents_enable_local_agent_entrypoints() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| crate::auth::AuthStateProvider::new_for_test());
 
         let _enabled = FeatureFlag::AcpClient.override_enabled(true);
         AISettings::handle(&app).read(&app, |settings, _ctx| {
@@ -621,6 +622,40 @@ fn test_configured_acp_agents_enable_local_agent_entrypoints() {
 
         AISettings::handle(&app).read(&app, |settings, _ctx| {
             assert!(settings.has_configured_local_acp_agents());
+        });
+    });
+}
+
+#[test]
+fn test_configured_acp_agents_preserve_agent_default_session_modes() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| crate::auth::AuthStateProvider::new_for_test());
+
+        let _enabled = FeatureFlag::AcpClient.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            report_if_error!(settings
+                .default_session_mode_internal
+                .set_value(DefaultSessionMode::CloudAgent, ctx));
+            assert_eq!(
+                settings.default_session_mode(ctx),
+                DefaultSessionMode::Terminal
+            );
+
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert_eq!(
+                settings.default_session_mode(ctx),
+                DefaultSessionMode::CloudAgent
+            );
+
+            report_if_error!(settings
+                .default_session_mode_internal
+                .set_value(DefaultSessionMode::Agent, ctx));
+            assert_eq!(
+                settings.default_session_mode(ctx),
+                DefaultSessionMode::Agent
+            );
         });
     });
 }

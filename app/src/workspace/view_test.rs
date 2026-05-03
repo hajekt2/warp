@@ -2697,6 +2697,37 @@ fn test_unified_new_session_menu_uses_new_worktree_config_label_and_order() {
 }
 
 #[test]
+fn test_unified_new_session_menu_shows_agent_items_for_local_acp_only() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_local_agent_entrypoint_enabled(ctx));
+        });
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let labels = workspace
+                .unified_new_session_menu_items(ctx)
+                .iter()
+                .map(new_session_menu_label)
+                .collect::<Vec<_>>();
+
+            assert!(labels.iter().any(|label| label == "Agent"));
+            assert!(labels.iter().any(|label| label == "Cloud Oz"));
+        });
+    });
+}
+
+#[test]
 fn test_unified_new_session_menu_includes_reopen_closed_session() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
