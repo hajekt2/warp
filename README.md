@@ -27,6 +27,19 @@
 
 [Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
 
+## Experimental ACP Client Prototype
+
+This fork includes an experimental implementation of Warp as an Agent Client Protocol (ACP) client for local external agents such as OpenCode or Codex-compatible ACP runtimes.
+
+- Short demo: [`docs/assets/warp-acp-demo.mp4`](docs/assets/warp-acp-demo.mp4)
+- Prototype notes: [`docs/ACP_CLIENT_PROTOTYPE.md`](docs/ACP_CLIENT_PROTOTYPE.md)
+- Product/technical specs: [`specs/GH7326`](specs/GH7326)
+
+The intent is to explore Warp as a native frontend for user-owned agent backends, where the external agent runtime owns model access, subscriptions, API keys, and provider-specific behavior while Warp owns the client UI and approval experience.
+
+> [!WARNING]
+> This is an experimental fork/prototype, not an official Warp release.
+
 ## Installation
 
 You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.

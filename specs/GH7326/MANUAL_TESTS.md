@@ -10,8 +10,6 @@
 
 ## Local ACP CLI smoke checks
 
-Run from `/home/haja/work/warp`.
-
 ### Codex ACP wrapper
 
 Command:
@@ -43,7 +41,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 Result on 2026-04-29 and rechecked on 2026-04-30: passed handshake with OpenCode `1.14.29`. OpenCode returned protocol version `1`, `agentInfo.name = "OpenCode"`, `agentInfo.version = "1.14.29"`, and auth instructions. Two local compatibility findings were captured:
 
-- Bare `opencode acp` failed before handshake because a long-running orphaned `/home/haja/.npm-global/lib/node_modules/opencode-ai/bin/.opencode serve` process was already listening on `0.0.0.0:4096` (PID `834381`, parent `1`). The Warp registry seeds OpenCode as `opencode acp --port 0` so ACP gets an ephemeral HTTP port and avoids collisions with existing OpenCode servers.
+- Bare `opencode acp` failed before handshake because a long-running orphaned `.npm-global/lib/node_modules/opencode-ai/bin/.opencode serve` process was already listening on `0.0.0.0:4096` (PID `834381`, parent `1`). The Warp registry seeds OpenCode as `opencode acp --port 0` so ACP gets an ephemeral HTTP port and avoids collisions with existing OpenCode servers.
 - OpenCode rejects `initialize` when `clientInfo.version` is omitted (`-32602 Invalid params`). Warp's conservative initialize request includes the `warp_acp` crate version for ACP schema compatibility.
 
 Direct live prompt smoke on 2026-04-30:
