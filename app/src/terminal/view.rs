@@ -24992,13 +24992,22 @@ impl TypedActionView for TerminalView {
                     && AISettings::as_ref(ctx).is_local_agent_entrypoint_enabled(ctx)
                     && !(self.is_ambient_agent_session(ctx) && !self.is_nested_cloud_mode(ctx))
                 {
-                    self.enter_agent_view_for_new_conversation(
-                        None,
-                        AgentViewEntryOrigin::Input {
-                            was_prompt_autodetected: false,
-                        },
-                        ctx,
-                    );
+                    let ai_settings = AISettings::as_ref(ctx);
+                    if !ai_settings.is_any_ai_enabled(ctx)
+                        && ai_settings.has_configured_local_acp_agents()
+                        && FeatureFlag::CloudMode.is_enabled()
+                        && FeatureFlag::CloudModeFromLocalSession.is_enabled()
+                    {
+                        self.enter_cloud_agent_view(None, ctx);
+                    } else {
+                        self.enter_agent_view_for_new_conversation(
+                            None,
+                            AgentViewEntryOrigin::Input {
+                                was_prompt_autodetected: false,
+                            },
+                            ctx,
+                        );
+                    }
                 } else {
                     self.input.update(ctx, |input, ctx| {
                         input.set_input_mode_agent(false, ctx);

@@ -2057,9 +2057,9 @@ impl AISettings {
         match mode {
             // Terminal and TabConfig don't require AI.
             DefaultSessionMode::Terminal | DefaultSessionMode::TabConfig => mode,
-            // Agent and CloudAgent require AI to be enabled.
+            // Agent entrypoints require either hosted AI or a configured local agent.
             DefaultSessionMode::Agent | DefaultSessionMode::CloudAgent => {
-                if self.is_any_ai_enabled(app) {
+                if self.is_local_agent_entrypoint_enabled(app) {
                     mode
                 } else {
                     DefaultSessionMode::Terminal

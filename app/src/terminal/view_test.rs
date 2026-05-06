@@ -521,21 +521,51 @@ fn root_cloud_mode_pane_sets_root_cloud_mode_context_key() {
 }
 
 #[test]
-fn set_input_mode_agent_enters_agent_view_when_local_acp_is_configured() {
+fn set_input_mode_agent_enters_cloud_composer_when_only_local_acp_is_configured() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+        let _cloud_mode_from_local = FeatureFlag::CloudModeFromLocalSession.override_enabled(true);
+        let _agent_harness = FeatureFlag::AgentHarness.override_enabled(true);
         let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
 
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
             settings.add_acp_agent_from_registry_entry("opencode", ctx);
         });
 
         let terminal = add_window_with_terminal(&mut app, None);
+        let root_view = terminal.clone();
+        let terminal_for_stack = terminal.clone();
+        let root_model = terminal.read(&app, |view, _| view.model.clone());
+        let pane_stack = app.update(move |ctx| {
+            let root_manager = ctx.add_model(|_| {
+                let manager: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: root_model,
+                    view: root_view.clone(),
+                });
+                manager
+            });
+            let pane_stack = ctx.add_model(|ctx| PaneStack::new(root_manager, root_view, ctx));
+            terminal_for_stack.update(ctx, |view, ctx| {
+                view.set_pane_stack(pane_stack.downgrade(), ctx);
+            });
+            pane_stack
+        });
 
         terminal.update(&mut app, |view, ctx| {
             assert!(!view.agent_view_controller().as_ref(ctx).is_active());
             view.handle_action(&TerminalAction::SetInputModeAgent, ctx);
+        });
+
+        let active_view = app.read_model(&pane_stack, |stack, _| stack.active_view().clone());
+        assert_ne!(active_view.id(), terminal.id());
+        active_view.read(&app, |view, ctx| {
+            let ambient_model = view
+                .ambient_agent_view_model()
+                .expect("Ctrl+I should open cloud composer for local ACP-only setup");
+            assert!(ambient_model.as_ref(ctx).is_configuring_ambient_agent());
             assert!(view.agent_view_controller().as_ref(ctx).is_active());
         });
     });

@@ -6035,16 +6035,16 @@ impl Workspace {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
 
-        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let ai_settings = AISettings::as_ref(ctx);
+        let is_local_agent_entrypoint_enabled = ai_settings.is_local_agent_entrypoint_enabled(ctx);
         let effective_default = ai_settings.default_session_mode(ctx);
         let default_tab_config_path = ai_settings.default_tab_config_path().to_string();
         let shortcut_label = keybinding_name_to_display_string(NEW_TAB_BINDING_NAME, ctx);
         let reopen_closed_session_shortcut_label =
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
 
-        // 1. Agent (if AI enabled)
-        if is_any_ai_enabled {
+        // 1. Agent (if hosted AI or a local ACP agent is available)
+        if is_local_agent_entrypoint_enabled {
             let mut agent_item = MenuItemFields::new("Agent")
                 .with_on_select_action(WorkspaceAction::AddAgentTab)
                 .with_icon(icons::Icon::LayoutAlt01);
@@ -6111,7 +6111,7 @@ impl Workspace {
         }
 
         // 3. Cloud Oz (if flags enabled)
-        if is_any_ai_enabled
+        if is_local_agent_entrypoint_enabled
             && FeatureFlag::AgentView.is_enabled()
             && FeatureFlag::CloudMode.is_enabled()
         {
