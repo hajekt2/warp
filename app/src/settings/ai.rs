@@ -2052,6 +2052,10 @@ impl AISettings {
         self.is_any_ai_enabled(app) || self.has_configured_local_acp_agents()
     }
 
+    pub fn is_conversation_history_entrypoint_enabled(&self, app: &AppContext) -> bool {
+        self.is_local_agent_entrypoint_enabled(app) && *self.show_conversation_history
+    }
+
     pub fn default_session_mode(&self, app: &AppContext) -> DefaultSessionMode {
         let mode = *self.default_session_mode_internal.value();
         match mode {

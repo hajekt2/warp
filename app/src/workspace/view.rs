@@ -2976,7 +2976,8 @@ impl Workspace {
 
         ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| match event {
             AISettingsChangedEvent::IsAnyAIEnabled { .. }
-            | AISettingsChangedEvent::ShowConversationHistory { .. } => {
+            | AISettingsChangedEvent::ShowConversationHistory { .. }
+            | AISettingsChangedEvent::AcpAgentConfigs { .. } => {
                 me.update_left_panel_available_views(ctx);
                 ctx.notify();
             }
@@ -7812,7 +7813,7 @@ impl Workspace {
     /// will respect the user's visibility preference (restored from workspace state).
     fn maybe_auto_open_conversation_list(&mut self, ctx: &mut ViewContext<Self>) {
         if !FeatureFlag::AgentViewConversationListView.is_enabled()
-            || !AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+            || !AISettings::as_ref(ctx).is_conversation_history_entrypoint_enabled(ctx)
         {
             return;
         }
@@ -19672,8 +19673,7 @@ impl Workspace {
     fn compute_left_panel_views(ctx: &AppContext) -> Vec<ToolPanelView> {
         let mut views = vec![];
         if FeatureFlag::AgentViewConversationListView.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
-            && *AISettings::as_ref(ctx).show_conversation_history
+            && AISettings::as_ref(ctx).is_conversation_history_entrypoint_enabled(ctx)
         {
             views.push(ToolPanelView::ConversationListView);
         }
@@ -21864,9 +21864,7 @@ impl View for Workspace {
             context.set.insert(flags::ENABLE_WARP_DRIVE);
         }
 
-        if AISettings::as_ref(app).is_any_ai_enabled(app)
-            && *AISettings::as_ref(app).show_conversation_history
-        {
+        if AISettings::as_ref(app).is_conversation_history_entrypoint_enabled(app) {
             context.set.insert(flags::SHOW_CONVERSATION_HISTORY);
         }
 

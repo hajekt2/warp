@@ -2778,6 +2778,54 @@ fn test_unified_new_session_menu_uses_new_worktree_config_label_and_order() {
 }
 
 #[test]
+fn test_left_panel_conversation_list_available_for_local_acp_only() {
+    let _conversation_list = FeatureFlag::AgentViewConversationListView.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            settings.add_acp_agent_from_registry_entry("opencode", ctx);
+            assert!(!settings.is_any_ai_enabled(ctx));
+            assert!(settings.is_conversation_history_entrypoint_enabled(ctx));
+        });
+
+        app.update(|ctx| {
+            let views = Workspace::compute_left_panel_views(ctx);
+            assert!(
+                views.contains(&ToolPanelView::ConversationListView),
+                "local ACP-only setups should expose the Agent conversations left-panel view"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_left_panel_conversation_list_unavailable_without_hosted_ai_or_local_acp() {
+    let _conversation_list = FeatureFlag::AgentViewConversationListView.override_enabled(true);
+    let _acp_client = FeatureFlag::AcpClient.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            report_if_error!(settings.is_any_ai_enabled.set_value(false, ctx));
+            assert!(!settings.is_conversation_history_entrypoint_enabled(ctx));
+        });
+
+        app.update(|ctx| {
+            let views = Workspace::compute_left_panel_views(ctx);
+            assert!(
+                !views.contains(&ToolPanelView::ConversationListView),
+                "conversation history should stay hidden when neither hosted AI nor local ACP is available"
+            );
+        });
+    });
+}
+
+#[test]
 fn test_unified_new_session_menu_shows_agent_items_for_local_acp_only() {
     let _agent_view = FeatureFlag::AgentView.override_enabled(true);
     let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
