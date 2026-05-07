@@ -31,7 +31,7 @@
 
 This fork includes an experimental implementation of Warp as an Agent Client Protocol (ACP) client for local external agents such as OpenCode or Codex-compatible ACP runtimes.
 
-- Short demo: [`docs/assets/warp-acp-demo.mp4`](docs/assets/warp-acp-demo.mp4)
+https://github.com/user-attachments/assets/f328f672-4998-4d23-b924-e2a63a345a36
 - Prototype notes: [`docs/ACP_CLIENT_PROTOTYPE.md`](docs/ACP_CLIENT_PROTOTYPE.md)
 - Product/technical specs: [`specs/GH7326`](specs/GH7326)
 
